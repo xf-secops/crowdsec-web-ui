@@ -6,11 +6,13 @@ import type {
   BulkDeleteResult,
   CleanupByIpRequest,
   ConfigResponse,
+  DashboardStatsResponse,
   DecisionListItem,
   NotificationChannel,
   NotificationListResponse,
   NotificationRule,
   NotificationSettingsResponse,
+  PaginatedResponse,
   SlimAlert,
   StatsAlert,
   StatsDecision,
@@ -19,16 +21,50 @@ import type {
 } from '../types';
 import { apiUrl } from './basePath';
 
-async function fetchJson<T>(input: string, init?: RequestInit, defaultMsg?: string): Promise<T> {
-    const response = await fetch(apiUrl(input), init);
+const inFlightGetRequests = new Map<string, Promise<unknown>>();
+
+async function requestJson<T>(url: string, init: RequestInit | undefined, defaultMsg: string | undefined): Promise<T> {
+    const response = await fetch(url, init);
     if (!response.ok) {
         throw new Error(defaultMsg || 'Request failed');
     }
     return response.json() as Promise<T>;
 }
 
+async function fetchJson<T>(input: string, init?: RequestInit, defaultMsg?: string): Promise<T> {
+    const url = apiUrl(input);
+    if (init === undefined) {
+        const inFlightRequest = inFlightGetRequests.get(url);
+        if (inFlightRequest) {
+            return inFlightRequest as Promise<T>;
+        }
+
+        const request = requestJson<T>(url, init, defaultMsg).finally(() => {
+            if (inFlightGetRequests.get(url) === request) {
+                inFlightGetRequests.delete(url);
+            }
+        });
+        inFlightGetRequests.set(url, request);
+        return request;
+    }
+
+    return requestJson<T>(url, init, defaultMsg);
+}
+
 export async function fetchAlerts(): Promise<SlimAlert[]> {
     return fetchJson<SlimAlert[]>('/api/alerts', undefined, 'Failed to fetch alerts');
+}
+
+export async function fetchAlertsPaginated(
+    page: number,
+    pageSize = 50,
+    filters?: Record<string, string>,
+): Promise<PaginatedResponse<SlimAlert>> {
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    for (const [key, value] of Object.entries(filters ?? {})) {
+        if (value) params.set(key, value);
+    }
+    return fetchJson<PaginatedResponse<SlimAlert>>(`/api/alerts?${params.toString()}`, undefined, 'Failed to fetch alerts');
 }
 
 export async function fetchAlert(id: string | number): Promise<AlertRecord> {
@@ -45,6 +81,18 @@ export async function fetchAlert(id: string | number): Promise<AlertRecord> {
 
 export async function fetchDecisions(): Promise<DecisionListItem[]> {
     return fetchJson<DecisionListItem[]>('/api/decisions', undefined, 'Failed to fetch decisions');
+}
+
+export async function fetchDecisionsPaginated(
+    page: number,
+    pageSize = 50,
+    filters?: Record<string, string>,
+): Promise<PaginatedResponse<DecisionListItem>> {
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    for (const [key, value] of Object.entries(filters ?? {})) {
+        if (value) params.set(key, value);
+    }
+    return fetchJson<PaginatedResponse<DecisionListItem>>(`/api/decisions?${params.toString()}`, undefined, 'Failed to fetch decisions');
 }
 
 // Helper to handle API errors with specific 403 guidance
@@ -92,6 +140,22 @@ export async function fetchDecisionsForStats(): Promise<StatsDecision[]> {
 
 export async function fetchAlertsForStats(): Promise<StatsAlert[]> {
     return fetchJson<StatsAlert[]>('/api/stats/alerts', undefined, 'Failed to fetch alert statistics');
+}
+
+export async function fetchDashboardStats(
+  filters?: Record<string, string>,
+  init?: RequestInit,
+): Promise<DashboardStatsResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters ?? {})) {
+    if (value) params.set(key, value);
+  }
+  const query = params.toString();
+  return fetchJson<DashboardStatsResponse>(
+    `/api/dashboard/stats${query ? `?${query}` : ''}`,
+    init,
+    'Failed to fetch dashboard statistics',
+  );
 }
 
 export async function deleteDecision(id: string | number): Promise<unknown> {

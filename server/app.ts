@@ -13,8 +13,16 @@ import type {
   BulkDeleteFailure,
   CleanupByIpRequest,
   ConfigResponse,
+  DashboardGranularity,
+  DashboardSimulationFilter,
+  DashboardStatListItem,
+  DashboardStatsBucket,
+  DashboardStatsResponse,
+  DashboardStatsTotals,
+  DashboardWorldMapDatum,
   DecisionListItem,
   LapiStatus,
+  PaginatedResponse,
   SlimAlert,
   StatsAlert,
   StatsDecision,
@@ -100,6 +108,99 @@ interface CachedAlertRecord {
   raw_data: string;
 }
 
+interface PageRequest {
+  page: number;
+  pageSize: number;
+}
+
+interface AlertListFilters {
+  q: string;
+  ip: string;
+  country: string;
+  scenario: string;
+  as: string;
+  date: string;
+  dateStart: string;
+  dateEnd: string;
+  target: string;
+  simulation: string;
+  timezoneOffsetMinutes: number;
+}
+
+interface DecisionListFilters {
+  q: string;
+  alertId: string;
+  country: string;
+  scenario: string;
+  as: string;
+  ip: string;
+  target: string;
+  dateStart: string;
+  dateEnd: string;
+  simulation: string;
+  showDuplicates: boolean;
+  timezoneOffsetMinutes: number;
+}
+
+interface DashboardStatsFilters {
+  country: string;
+  scenario: string;
+  as: string;
+  ip: string;
+  target: string;
+  dateStart: string;
+  dateEnd: string;
+  simulation: DashboardSimulationFilter;
+  granularity: DashboardGranularity;
+  timezoneOffsetMinutes: number;
+}
+
+interface DashboardStatsCache {
+  key: string;
+  alerts: DashboardAlertStatsRecord[];
+  decisions: DashboardDecisionStatsRecord[];
+  totals: DashboardStatsTotals;
+}
+
+interface DashboardAlertStatsRecord {
+  createdAt: string;
+  timestamp: number;
+  country?: string;
+  scenario?: string;
+  asName?: string;
+  ip?: string;
+  target?: string;
+  simulated: boolean;
+}
+
+interface DashboardDecisionStatsRecord {
+  createdAt: string;
+  stopAt?: string;
+  timestamp: number;
+  stopTimestamp: number;
+  value?: string;
+  simulated: boolean;
+}
+
+interface DashboardStatsAccumulator {
+  alerts: number;
+  liveAlerts: number;
+  simulatedAlerts: number;
+  countries: Map<string, { count: number; liveCount: number; simulatedCount: number }>;
+  scenarios: Map<string, number>;
+  asNames: Map<string, number>;
+  targets: Map<string, number>;
+  liveAlertBuckets: Map<string, number>;
+  simulatedAlertBuckets: Map<string, number>;
+}
+
+interface DashboardDecisionAccumulator {
+  decisions: number;
+  simulatedDecisions: number;
+  liveDecisionBuckets: Map<string, number>;
+  simulatedDecisionBuckets: Map<string, number>;
+}
+
 const NOTIFICATION_SECRET_KEY_META_KEY = 'notification_secret_key';
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const UNFILTERED_ALERT_ORIGIN_TOKENS = new Set(['none']);
@@ -162,6 +263,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     isInitialized: false,
     lastUpdate: null,
   };
+  let dashboardStatsCache: DashboardStatsCache | null = null;
 
   const persistedConfig = loadPersistedConfig(database);
   let refreshIntervalMs = persistedConfig.refresh_interval_ms ?? config.refreshIntervalMs;
@@ -222,12 +324,24 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       }
 
       const since = new Date(Date.now() - config.lookbackMs).toISOString();
-      const alerts = database
-        .getAlertsSince(since)
-        .map((row) => applySimulationModeToAlert(hydrateAlertWithDecisions(JSON.parse(row.raw_data) as AlertRecord), config.simulationsEnabled))
+      const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
+        .map((alert) => applySimulationModeToAlert(alert, config.simulationsEnabled))
         .filter((alert): alert is AlertRecord => alert !== null)
         .map((alert) => toSlimAlert(alert))
         .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+
+      const pageRequest = getPageRequest(context);
+      if (pageRequest) {
+        const filters = getAlertListFilters(context);
+        const machineFeaturesEnabled = isMachineFeatureEnabled();
+        const filteredAlerts = alerts.filter((alert) => matchesAlertListFilters(alert, filters, machineFeaturesEnabled));
+        return context.json(toPaginatedResponse(
+          filteredAlerts,
+          pageRequest,
+          alerts.length,
+          filteredAlerts.map((alert) => alert.id),
+        ));
+      }
 
       return context.json(alerts);
     } catch (error: any) {
@@ -295,6 +409,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       const result = await lapiClient.deleteAlert(alertId);
       database.deleteAlert(alertId);
       database.deleteDecisionsByAlertId(alertId);
+      dashboardStatsCache = null;
       return context.json((result as object) || { message: 'Deleted' });
     };
 
@@ -322,12 +437,33 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         ? database.getDecisionsSince(since, now)
         : database.getActiveDecisions(now);
 
-      let decisions = rows.map((row) => toDecisionListItem(JSON.parse(row.raw_data) as AlertDecision & Record<string, unknown>, includeExpired));
+      let decisions = rows.map((row) => {
+        const decision = JSON.parse(row.raw_data) as AlertDecision & Record<string, unknown>;
+        if (decision.alert_id === undefined && row.alert_id !== undefined && row.alert_id !== null) {
+          decision.alert_id = row.alert_id;
+        }
+        return toDecisionListItem(decision, includeExpired);
+      });
       if (!config.simulationsEnabled) {
         decisions = decisions.filter((decision) => !decision.simulated);
       }
       decisions = markDuplicateDecisions(decisions);
       decisions.sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+
+      const pageRequest = getPageRequest(context);
+      if (pageRequest) {
+        const filters = getDecisionListFilters(context);
+        const machineFeaturesEnabled = isMachineFeatureEnabled();
+        const filteredDecisions = decisions.filter((decision) => matchesDecisionListFilters(decision, filters, machineFeaturesEnabled));
+        return context.json(toPaginatedResponse(
+          filteredDecisions,
+          pageRequest,
+          decisions.length,
+          filteredDecisions
+            .filter((decision) => !isDecisionListItemExpired(decision))
+            .map((decision) => decision.id),
+        ));
+      }
 
       return context.json(decisions);
     } catch (error: any) {
@@ -495,6 +631,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       database.clearSyncData();
       cache.isInitialized = false;
       cache.lastUpdate = null;
+      dashboardStatsCache = null;
       isFirstSync = true;
       await ensureBootstrapReady('manual cache clear');
 
@@ -520,11 +657,10 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       }
 
       const since = new Date(Date.now() - config.lookbackMs).toISOString();
-      const alerts = database
-        .getAlertsSince(since)
-        .map((row) => {
+      const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
+        .map((hydratedAlert) => {
           const alert = applySimulationModeToAlert(
-            hydrateAlertWithDecisions(JSON.parse(row.raw_data) as AlertRecord),
+            hydratedAlert,
             config.simulationsEnabled,
           );
           if (!alert) {
@@ -593,6 +729,23 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     } catch (error: any) {
       console.error('Error serving stats decisions from database:', error.message);
       return context.json({ error: 'Failed to retrieve decision statistics' }, 500);
+    }
+  });
+
+  app.get(`${config.basePath}/api/dashboard/stats`, ensureAuth, async (context) => {
+    try {
+      if (refreshIntervalMs === 0) {
+        await updateCache();
+      }
+
+      if (!cache.isInitialized) {
+        await ensureBootstrapReady('dashboard stats request');
+      }
+
+      return context.json(buildDashboardStats(getDashboardStatsFilters(context)));
+    } catch (error: any) {
+      console.error('Error serving dashboard statistics from database:', error.message);
+      return context.json({ error: 'Failed to retrieve dashboard statistics' }, 500);
     }
   });
 
@@ -666,6 +819,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       const result = await lapiClient.deleteDecision(decisionId);
       console.log(`Removing decision ${decisionId} from local cache...`);
       database.deleteDecision(decisionId);
+      dashboardStatsCache = null;
       return context.json((result as object) || { message: 'Deleted' });
     };
 
@@ -1403,6 +1557,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         }
       });
       removeAlerts(deletedAlertIds);
+      dashboardStatsCache = null;
     }
 
     result.deleted_alerts = deletedAlertIds.length;
@@ -1434,6 +1589,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         }
       });
       removeDecisions(deletedDecisionIds);
+      dashboardStatsCache = null;
     }
 
     result.deleted_decisions = deletedDecisionIds.length;
@@ -1503,6 +1659,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         }
       });
       removeAlerts(deletedAlertIds);
+      dashboardStatsCache = null;
     }
 
     const decisionIdsToDelete = Array.from(deletedDecisionIds).filter((id) => !alertDecisionIds.has(id));
@@ -1513,6 +1670,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         }
       });
       removeDecisions(decisionIdsToDelete);
+      dashboardStatsCache = null;
     }
 
     result.deleted_alerts = deletedAlertIds.length;
@@ -1590,6 +1748,209 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     clone.simulated = isAlertSimulated(clone);
 
     return clone;
+  }
+
+  function hydrateAlertWithDecisionsBatch(alert: AlertRecord, stopAtMap: Map<string, string>): AlertRecord {
+    const clone: AlertRecord = { ...alert };
+    const decisions = Array.isArray(clone.decisions) ? clone.decisions : [];
+
+    clone.decisions = decisions.map((decision) => {
+      const cachedStopAt = stopAtMap.get(String(decision.id));
+      const now = new Date();
+      const stopAt = cachedStopAt
+        ? new Date(cachedStopAt)
+        : decision.stop_at
+          ? new Date(decision.stop_at)
+          : null;
+      const isExpired = !stopAt || stopAt < now;
+
+      let duration = decision.duration;
+      if (stopAt && !isExpired) {
+        const remainingMs = stopAt.getTime() - now.getTime();
+        const hours = Math.floor(remainingMs / 3_600_000);
+        const minutes = Math.floor((remainingMs % 3_600_000) / 60_000);
+        const seconds = Math.floor((remainingMs % 60_000) / 1_000);
+        duration = `${hours > 0 ? `${hours}h` : ''}${minutes > 0 || hours > 0 ? `${minutes}m` : ''}${seconds}s`;
+      } else if (isExpired) {
+        duration = '0s';
+      }
+
+      return {
+        ...decision,
+        stop_at: stopAt ? stopAt.toISOString() : decision.stop_at,
+        duration,
+        expired: isExpired,
+        simulated: normalizeDecisionSimulated(decision, clone),
+      };
+    });
+
+    clone.reason = resolveAlertReason(clone);
+    clone.scenario = resolveAlertScenario(clone);
+    clone.simulated = isAlertSimulated(clone);
+
+    return clone;
+  }
+
+  function hydrateAlertsBatch(rows: Array<{ raw_data: string }>): AlertRecord[] {
+    const parsedAlerts = rows.map((row) => JSON.parse(row.raw_data) as AlertRecord);
+    const decisionIds = parsedAlerts.flatMap((alert) =>
+      (Array.isArray(alert.decisions) ? alert.decisions : []).map((decision) => String(decision.id)),
+    );
+    const stopAtMap = database.getDecisionStopAtBatch(decisionIds);
+    return parsedAlerts.map((alert) => hydrateAlertWithDecisionsBatch(alert, stopAtMap));
+  }
+
+  function getDashboardStatsIndex(): DashboardStatsCache {
+    const cacheKey = `${cache.lastUpdate || 'uninitialized'}:${config.lookbackMs}:${config.simulationsEnabled ? 'sim' : 'live'}`;
+    if (dashboardStatsCache?.key === cacheKey) {
+      return dashboardStatsCache;
+    }
+
+    const since = new Date(Date.now() - config.lookbackMs).toISOString();
+    const nowIso = new Date().toISOString();
+    const nowTimestamp = Date.now();
+
+    const alerts = hydrateAlertsBatch(database.getAlertsSince(since))
+      .map((hydratedAlert) => applySimulationModeToAlert(hydratedAlert, config.simulationsEnabled))
+      .filter((alert): alert is AlertRecord => alert !== null)
+      .flatMap((alert): DashboardAlertStatsRecord[] => {
+        const timestamp = Date.parse(alert.created_at);
+        if (!Number.isFinite(timestamp)) {
+          return [];
+        }
+
+        return [{
+          createdAt: alert.created_at,
+          timestamp,
+          country: alert.source?.cn,
+          scenario: resolveAlertScenario(alert),
+          asName: alert.source?.as_name,
+          ip: alert.source?.ip,
+          target: alert.target,
+          simulated: isAlertSimulated(alert),
+        }];
+      });
+
+    const decisions = database
+      .getDecisionsSince(since, nowIso)
+      .flatMap((row): DashboardDecisionStatsRecord[] => {
+        try {
+          const decision = JSON.parse(row.raw_data) as Record<string, unknown>;
+          const createdAt = String(decision.created_at || row.created_at || '');
+          const timestamp = Date.parse(createdAt);
+          if (!Number.isFinite(timestamp)) {
+            return [];
+          }
+
+          const stopAt = typeof decision.stop_at === 'string' ? decision.stop_at : undefined;
+          const stopTimestamp = stopAt ? Date.parse(stopAt) : Number.NaN;
+          return [{
+            createdAt,
+            stopAt,
+            timestamp,
+            stopTimestamp: Number.isFinite(stopTimestamp) ? stopTimestamp : 0,
+            value: typeof decision.value === 'string' ? decision.value : undefined,
+            simulated: normalizeDecisionSimulated(decision as AlertDecision & Record<string, unknown>),
+          }];
+        } catch {
+          return [];
+        }
+      })
+      .filter((decision) => config.simulationsEnabled || !decision.simulated);
+
+    const totals: DashboardStatsTotals = {
+      alerts: alerts.length,
+      decisions: decisions.filter((decision) => !decision.simulated && decision.stopTimestamp > nowTimestamp).length,
+      simulatedAlerts: alerts.filter((alert) => alert.simulated).length,
+      simulatedDecisions: decisions.filter((decision) => decision.simulated && decision.stopTimestamp > nowTimestamp).length,
+    };
+
+    dashboardStatsCache = { key: cacheKey, alerts, decisions, totals };
+    return dashboardStatsCache;
+  }
+
+  function buildDashboardStats(filters: DashboardStatsFilters): DashboardStatsResponse {
+    const statsIndex = getDashboardStatsIndex();
+    const nowTimestamp = Date.now();
+    const lookbackDays = Math.max(1, Math.round(lookbackHours(config.lookbackPeriod) / 24));
+
+    const filteredAlertAccumulator = createDashboardStatsAccumulator();
+    const chartAlertAccumulator = createDashboardStatsAccumulator();
+    const sliderAlertAccumulator = createDashboardStatsAccumulator();
+    const filteredAlertIps = new Set<string>();
+    const sliderAlertIps = new Set<string>();
+
+    for (const alert of statsIndex.alerts) {
+      if (!matchesDashboardSimulationFilter(alert.simulated, filters.simulation)) {
+        continue;
+      }
+
+      if (matchesDashboardAlertFilters(alert, filters, false)) {
+        addDashboardAlert(sliderAlertAccumulator, alert, filters);
+        if (alert.ip) {
+          sliderAlertIps.add(alert.ip);
+        }
+      }
+
+      if (matchesDashboardAlertFilters(alert, filters, true)) {
+        addDashboardAlert(filteredAlertAccumulator, alert, filters);
+        addDashboardAlert(chartAlertAccumulator, alert, filters);
+        if (alert.ip) {
+          filteredAlertIps.add(alert.ip);
+        }
+      }
+    }
+
+    const filteredDecisionAccumulator = createDashboardDecisionAccumulator();
+    const chartDecisionAccumulator = createDashboardDecisionAccumulator();
+    const sliderDecisionAccumulator = createDashboardDecisionAccumulator();
+
+    for (const decision of statsIndex.decisions) {
+      if (!matchesDashboardSimulationFilter(decision.simulated, filters.simulation)) {
+        continue;
+      }
+
+      if (matchesDashboardDecisionFilters(decision, filters, sliderAlertIps, false)) {
+        addDashboardDecision(sliderDecisionAccumulator, decision, filters);
+      }
+
+      if (matchesDashboardDecisionFilters(decision, filters, filteredAlertIps, true)) {
+        addDashboardDecision(chartDecisionAccumulator, decision, filters);
+        if (decision.stopTimestamp > nowTimestamp) {
+          if (decision.simulated) {
+            filteredDecisionAccumulator.simulatedDecisions += 1;
+          } else {
+            filteredDecisionAccumulator.decisions += 1;
+          }
+        }
+      }
+    }
+
+    return {
+      totals: statsIndex.totals,
+      filteredTotals: {
+        alerts: filteredAlertAccumulator.alerts,
+        decisions: filteredDecisionAccumulator.decisions,
+        simulatedAlerts: filteredAlertAccumulator.simulatedAlerts,
+        simulatedDecisions: filteredDecisionAccumulator.simulatedDecisions,
+      },
+      globalTotal: statsIndex.alerts.filter((alert) => matchesDashboardSimulationFilter(alert.simulated, filters.simulation)).length,
+      topTargets: topDashboardEntries(filteredAlertAccumulator.targets),
+      topCountries: dashboardCountryList(filteredAlertAccumulator.countries, 10),
+      allCountries: dashboardWorldMapData(filteredAlertAccumulator.countries),
+      topScenarios: topDashboardEntries(filteredAlertAccumulator.scenarios),
+      topAS: topDashboardEntries(filteredAlertAccumulator.asNames),
+      series: {
+        alertsHistory: dashboardBuckets(chartAlertAccumulator.liveAlertBuckets, filters, lookbackDays),
+        simulatedAlertsHistory: dashboardBuckets(chartAlertAccumulator.simulatedAlertBuckets, filters, lookbackDays),
+        decisionsHistory: dashboardBuckets(chartDecisionAccumulator.liveDecisionBuckets, filters, lookbackDays),
+        simulatedDecisionsHistory: dashboardBuckets(chartDecisionAccumulator.simulatedDecisionBuckets, filters, lookbackDays),
+        unfilteredAlertsHistory: dashboardBuckets(sliderAlertAccumulator.liveAlertBuckets, filters, lookbackDays, true),
+        unfilteredSimulatedAlertsHistory: dashboardBuckets(sliderAlertAccumulator.simulatedAlertBuckets, filters, lookbackDays, true),
+        unfilteredDecisionsHistory: dashboardBuckets(sliderDecisionAccumulator.liveDecisionBuckets, filters, lookbackDays, true),
+        unfilteredSimulatedDecisionsHistory: dashboardBuckets(sliderDecisionAccumulator.simulatedDecisionBuckets, filters, lookbackDays, true),
+      },
+    };
   }
 
   function normalizeAlertDetail(input: unknown, alertId: string): AlertRecord | null {
@@ -1870,4 +2231,484 @@ function getNumericDecisionId(id: string | number): number {
   }
   const numeric = Number.parseInt(value, 10);
   return Number.isNaN(numeric) ? Number.POSITIVE_INFINITY : numeric;
+}
+
+function getPageRequest(context: HonoContext): PageRequest | null {
+  if (!context.req.query('page')) {
+    return null;
+  }
+
+  const page = Math.max(1, Number.parseInt(context.req.query('page') || '1', 10) || 1);
+  const pageSize = Math.min(200, Math.max(10, Number.parseInt(context.req.query('page_size') || '50', 10) || 50));
+  return { page, pageSize };
+}
+
+function toPaginatedResponse<T>(
+  items: T[],
+  pageRequest: PageRequest,
+  unfilteredTotal: number,
+  selectableIds: Array<string | number>,
+): PaginatedResponse<T> {
+  const offset = (pageRequest.page - 1) * pageRequest.pageSize;
+  return {
+    data: items.slice(offset, offset + pageRequest.pageSize),
+    pagination: {
+      page: pageRequest.page,
+      page_size: pageRequest.pageSize,
+      total: items.length,
+      total_pages: Math.ceil(items.length / pageRequest.pageSize),
+      unfiltered_total: unfilteredTotal,
+    },
+    selectable_ids: selectableIds,
+  };
+}
+
+function getAlertListFilters(context: HonoContext): AlertListFilters {
+  return {
+    q: lowerQuery(context, 'q'),
+    ip: lowerQuery(context, 'ip'),
+    country: lowerQuery(context, 'country'),
+    scenario: lowerQuery(context, 'scenario'),
+    as: lowerQuery(context, 'as'),
+    date: context.req.query('date') || '',
+    dateStart: context.req.query('dateStart') || '',
+    dateEnd: context.req.query('dateEnd') || '',
+    target: lowerQuery(context, 'target'),
+    simulation: context.req.query('simulation') || 'all',
+    timezoneOffsetMinutes: parseTimezoneOffset(context),
+  };
+}
+
+function getDecisionListFilters(context: HonoContext): DecisionListFilters {
+  const alertId = context.req.query('alert_id') || '';
+  return {
+    q: lowerQuery(context, 'q'),
+    alertId,
+    country: context.req.query('country') || '',
+    scenario: context.req.query('scenario') || '',
+    as: context.req.query('as') || '',
+    ip: context.req.query('ip') || '',
+    target: lowerQuery(context, 'target'),
+    dateStart: context.req.query('dateStart') || '',
+    dateEnd: context.req.query('dateEnd') || '',
+    simulation: context.req.query('simulation') || 'all',
+    showDuplicates: context.req.query('hide_duplicates') === 'false' || Boolean(alertId),
+    timezoneOffsetMinutes: parseTimezoneOffset(context),
+  };
+}
+
+function getDashboardStatsFilters(context: HonoContext): DashboardStatsFilters {
+  return {
+    country: context.req.query('country') || '',
+    scenario: context.req.query('scenario') || '',
+    as: context.req.query('as') || '',
+    ip: context.req.query('ip') || '',
+    target: context.req.query('target') || '',
+    dateStart: context.req.query('dateStart') || '',
+    dateEnd: context.req.query('dateEnd') || '',
+    simulation: parseDashboardSimulationFilter(context.req.query('simulation')),
+    granularity: context.req.query('granularity') === 'hour' ? 'hour' : 'day',
+    timezoneOffsetMinutes: parseTimezoneOffset(context),
+  };
+}
+
+function parseDashboardSimulationFilter(value: string | undefined): DashboardSimulationFilter {
+  if (value === 'live' || value === 'simulated') {
+    return value;
+  }
+
+  return 'all';
+}
+
+function createDashboardStatsAccumulator(): DashboardStatsAccumulator {
+  return {
+    alerts: 0,
+    liveAlerts: 0,
+    simulatedAlerts: 0,
+    countries: new Map(),
+    scenarios: new Map(),
+    asNames: new Map(),
+    targets: new Map(),
+    liveAlertBuckets: new Map(),
+    simulatedAlertBuckets: new Map(),
+  };
+}
+
+function createDashboardDecisionAccumulator(): DashboardDecisionAccumulator {
+  return {
+    decisions: 0,
+    simulatedDecisions: 0,
+    liveDecisionBuckets: new Map(),
+    simulatedDecisionBuckets: new Map(),
+  };
+}
+
+function matchesDashboardSimulationFilter(isSimulated: boolean, filter: DashboardSimulationFilter): boolean {
+  return matchesSimulationFilter(isSimulated, filter);
+}
+
+function matchesDashboardAlertFilters(
+  alert: DashboardAlertStatsRecord,
+  filters: DashboardStatsFilters,
+  includeDateRange: boolean,
+): boolean {
+  if (filters.country && alert.country !== filters.country) return false;
+  if (filters.scenario && alert.scenario !== filters.scenario) return false;
+  if (filters.as && alert.asName !== filters.as) return false;
+  if (filters.ip && alert.ip !== filters.ip) return false;
+  if (filters.target && alert.target !== filters.target) return false;
+
+  if (includeDateRange && !matchesDashboardDateRange(alert.createdAt, filters)) {
+    return false;
+  }
+
+  return true;
+}
+
+function matchesDashboardDecisionFilters(
+  decision: DashboardDecisionStatsRecord,
+  filters: DashboardStatsFilters,
+  alertIps: Set<string>,
+  includeDateRange: boolean,
+): boolean {
+  if (filters.ip && decision.value !== filters.ip) return false;
+
+  if (requiresDashboardAlertIpJoin(filters) && (!decision.value || !alertIps.has(decision.value))) {
+    return false;
+  }
+
+  if (includeDateRange && !matchesDashboardDateRange(decision.createdAt, filters)) {
+    return false;
+  }
+
+  return true;
+}
+
+function requiresDashboardAlertIpJoin(filters: DashboardStatsFilters): boolean {
+  return Boolean(filters.country || filters.scenario || filters.as || filters.target);
+}
+
+function matchesDashboardDateRange(isoString: string, filters: DashboardStatsFilters): boolean {
+  if (!filters.dateStart && !filters.dateEnd) {
+    return true;
+  }
+
+  const itemKey = getDateFilterKey(
+    isoString,
+    filters.granularity === 'hour' || filters.dateStart.includes('T') || filters.dateEnd.includes('T'),
+    filters.timezoneOffsetMinutes,
+  );
+
+  if (filters.dateStart && itemKey < filters.dateStart) return false;
+  if (filters.dateEnd && itemKey > filters.dateEnd) return false;
+  return true;
+}
+
+function addDashboardAlert(accumulator: DashboardStatsAccumulator, alert: DashboardAlertStatsRecord, filters: DashboardStatsFilters): void {
+  accumulator.alerts += 1;
+
+  const bucketMap = alert.simulated ? accumulator.simulatedAlertBuckets : accumulator.liveAlertBuckets;
+  incrementCount(bucketMap, getDashboardBucketKey(alert.createdAt, filters));
+
+  if (alert.simulated) {
+    accumulator.simulatedAlerts += 1;
+  } else {
+    accumulator.liveAlerts += 1;
+  }
+
+  if (alert.country && alert.country !== 'Unknown') {
+    const current = accumulator.countries.get(alert.country) || { count: 0, liveCount: 0, simulatedCount: 0 };
+    current.count += 1;
+    if (alert.simulated) {
+      current.simulatedCount += 1;
+    } else {
+      current.liveCount += 1;
+    }
+    accumulator.countries.set(alert.country, current);
+  }
+
+  if (alert.scenario) {
+    incrementCount(accumulator.scenarios, alert.scenario);
+  }
+
+  if (alert.asName && alert.asName !== 'Unknown') {
+    incrementCount(accumulator.asNames, alert.asName);
+  }
+
+  if (alert.target && alert.target !== 'Unknown' && alert.target !== 'N/A') {
+    incrementCount(accumulator.targets, alert.target);
+  }
+}
+
+function addDashboardDecision(accumulator: DashboardDecisionAccumulator, decision: DashboardDecisionStatsRecord, filters: DashboardStatsFilters): void {
+  const bucketMap = decision.simulated ? accumulator.simulatedDecisionBuckets : accumulator.liveDecisionBuckets;
+  incrementCount(bucketMap, getDashboardBucketKey(decision.createdAt, filters));
+}
+
+function incrementCount(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function topDashboardEntries(map: Map<string, number>, limit = 10): DashboardStatListItem[] {
+  return Array.from(map.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, limit)
+    .map(([label, count]) => ({ label, count }));
+}
+
+function dashboardCountryList(
+  countries: DashboardStatsAccumulator['countries'],
+  limit: number,
+): DashboardStatListItem[] {
+  return Array.from(countries.entries())
+    .sort((left, right) => right[1].count - left[1].count)
+    .slice(0, limit)
+    .map(([code, summary]) => ({
+      label: getCountryName(code) || code,
+      value: code,
+      count: summary.count,
+      countryCode: code,
+    }));
+}
+
+function dashboardWorldMapData(countries: DashboardStatsAccumulator['countries']): DashboardWorldMapDatum[] {
+  return Array.from(countries.entries())
+    .map(([code, summary]) => ({
+      label: getCountryName(code) || code,
+      count: summary.count,
+      countryCode: code,
+      simulatedCount: summary.simulatedCount,
+      liveCount: summary.liveCount,
+    }));
+}
+
+function dashboardBuckets(
+  counts: Map<string, number>,
+  filters: DashboardStatsFilters,
+  lookbackDays: number,
+  ignoreDateRange = false,
+): DashboardStatsBucket[] {
+  const bucketKeys = getDashboardBucketKeys(filters, lookbackDays, ignoreDateRange);
+  return bucketKeys.map((date) => ({
+    date,
+    count: counts.get(date) || 0,
+    fullDate: getDashboardBucketFullDate(date, filters.timezoneOffsetMinutes),
+  }));
+}
+
+function getDashboardBucketKeys(
+  filters: DashboardStatsFilters,
+  lookbackDays: number,
+  ignoreDateRange: boolean,
+): string[] {
+  const keys: string[] = [];
+  const useExplicitRange = !ignoreDateRange && Boolean(filters.dateStart && filters.dateEnd);
+
+  if (useExplicitRange) {
+    let cursor = parseDashboardBucketKey(filters.dateStart, filters.timezoneOffsetMinutes);
+    const end = parseDashboardBucketKey(filters.dateEnd, filters.timezoneOffsetMinutes);
+    while (cursor <= end) {
+      keys.push(formatDashboardBucketKey(cursor, filters));
+      cursor = addDashboardBucketInterval(cursor, filters.granularity);
+    }
+    return keys;
+  }
+
+  const clientNow = new Date(Date.now() - filters.timezoneOffsetMinutes * 60_000);
+  const end = new Date(Date.UTC(
+    clientNow.getUTCFullYear(),
+    clientNow.getUTCMonth(),
+    clientNow.getUTCDate(),
+    filters.granularity === 'hour' ? clientNow.getUTCHours() : 0,
+    0,
+    0,
+    0,
+  ));
+  let cursor = new Date(Date.UTC(
+    clientNow.getUTCFullYear(),
+    clientNow.getUTCMonth(),
+    clientNow.getUTCDate() - (lookbackDays - 1),
+    0,
+    0,
+    0,
+    0,
+  ));
+
+  while (cursor <= end) {
+    keys.push(formatDashboardClientBucketKey(cursor, filters.granularity));
+    cursor = addDashboardBucketInterval(cursor, filters.granularity);
+  }
+
+  return keys;
+}
+
+function getDashboardBucketKey(isoString: string, filters: DashboardStatsFilters): string {
+  return getDateFilterKey(isoString, filters.granularity === 'hour', filters.timezoneOffsetMinutes);
+}
+
+function parseDashboardBucketKey(key: string, timezoneOffsetMinutes: number): Date {
+  const [datePart, timePart] = key.split('T');
+  const [year, month, day] = datePart.split('-').map(Number);
+  const hour = timePart === undefined ? 0 : Number(timePart);
+  return new Date(Date.UTC(year, month - 1, day, hour, 0, 0, 0) + timezoneOffsetMinutes * 60_000);
+}
+
+function formatDashboardClientBucketKey(date: Date, granularity: DashboardGranularity): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  if (granularity === 'hour') {
+    return `${year}-${month}-${day}T${String(date.getUTCHours()).padStart(2, '0')}`;
+  }
+  return `${year}-${month}-${day}`;
+}
+
+function formatDashboardBucketKey(date: Date, filters: DashboardStatsFilters): string {
+  return getDateFilterKey(date.toISOString(), filters.granularity === 'hour', filters.timezoneOffsetMinutes);
+}
+
+function addDashboardBucketInterval(date: Date, granularity: DashboardGranularity): Date {
+  const next = new Date(date);
+  if (granularity === 'hour') {
+    next.setUTCHours(next.getUTCHours() + 1);
+  } else {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+  return next;
+}
+
+function getDashboardBucketFullDate(key: string, timezoneOffsetMinutes: number): string {
+  return parseDashboardBucketKey(key, timezoneOffsetMinutes).toISOString();
+}
+
+function lowerQuery(context: HonoContext, key: string): string {
+  return (context.req.query(key) || '').toLowerCase();
+}
+
+function parseTimezoneOffset(context: HonoContext): number {
+  const value = Number.parseInt(context.req.query('tz_offset') || '0', 10);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function matchesAlertListFilters(alert: SlimAlert, filters: AlertListFilters, machineFeaturesEnabled: boolean): boolean {
+  if (!matchesSimulationFilter(alert.simulated === true, filters.simulation)) return false;
+
+  const scenario = (alert.scenario || '').toLowerCase();
+  const message = (alert.message || '').toLowerCase();
+  const sourceValue = (getAlertSourceValue(alert.source) || '').toLowerCase();
+  const cn = (alert.source?.cn || '').toLowerCase();
+  const asName = (alert.source?.as_name || '').toLowerCase();
+  const machine = machineFeaturesEnabled ? (resolveMachineName(alert) || '').toLowerCase() : '';
+  const target = (alert.target || '').toLowerCase();
+
+  if (filters.ip && !sourceValue.includes(filters.ip)) return false;
+  if (filters.country && !cn.includes(filters.country)) return false;
+  if (filters.scenario && !scenario.includes(filters.scenario)) return false;
+  if (filters.as && !asName.includes(filters.as)) return false;
+  if (filters.target && !target.includes(filters.target)) return false;
+  if (filters.date && !(alert.created_at && alert.created_at.startsWith(filters.date))) return false;
+
+  if (filters.dateStart || filters.dateEnd) {
+    const itemKey = getDateFilterKey(
+      alert.created_at,
+      filters.dateStart.includes('T') || filters.dateEnd.includes('T'),
+      filters.timezoneOffsetMinutes,
+    );
+    if (filters.dateStart && itemKey < filters.dateStart) return false;
+    if (filters.dateEnd && itemKey > filters.dateEnd) return false;
+  }
+
+  if (!filters.q) return true;
+
+  const countryName = (getCountryName(alert.source?.cn) || '').toLowerCase();
+  return scenario.includes(filters.q) ||
+    message.includes(filters.q) ||
+    sourceValue.includes(filters.q) ||
+    cn.includes(filters.q) ||
+    countryName.includes(filters.q) ||
+    asName.includes(filters.q) ||
+    (machineFeaturesEnabled && machine.includes(filters.q)) ||
+    target.includes(filters.q) ||
+    (alert.meta_search || '').toLowerCase().includes(filters.q) ||
+    (alert.simulated === true ? 'simulation simulated' : 'live').includes(filters.q);
+}
+
+function matchesDecisionListFilters(decision: DecisionListItem, filters: DecisionListFilters, machineFeaturesEnabled: boolean): boolean {
+  if (!filters.showDuplicates && decision.is_duplicate) return false;
+  if (filters.alertId && String(decision.detail.alert_id) !== filters.alertId) return false;
+  if (!matchesSimulationFilter(decision.simulated === true, filters.simulation)) return false;
+  if (filters.country && decision.detail.country !== filters.country) return false;
+  if (filters.scenario && decision.detail.reason !== filters.scenario) return false;
+  if (filters.as && decision.detail.as !== filters.as) return false;
+  if (filters.ip && decision.value !== filters.ip) return false;
+
+  if (filters.target) {
+    const value = (decision.value || '').toLowerCase();
+    const target = (decision.detail.target || '').toLowerCase();
+    if (!value.includes(filters.target) && !target.includes(filters.target)) return false;
+  }
+
+  if (filters.dateStart || filters.dateEnd) {
+    if (!decision.created_at) return false;
+    const itemKey = getDateFilterKey(
+      decision.created_at,
+      filters.dateStart.includes('T') || filters.dateEnd.includes('T'),
+      filters.timezoneOffsetMinutes,
+    );
+    if (filters.dateStart && itemKey < filters.dateStart) return false;
+    if (filters.dateEnd && itemKey > filters.dateEnd) return false;
+  }
+
+  if (!filters.q) return true;
+
+  const countryCode = (decision.detail.country || '').toLowerCase();
+  const countryName = (getCountryName(decision.detail.country) || '').toLowerCase();
+  const machine = machineFeaturesEnabled ? (decision.machine || '').toLowerCase() : '';
+  const simulationSearch = decision.simulated === true ? 'simulation simulated' : 'live';
+
+  return (decision.value || '').toLowerCase().includes(filters.q) ||
+    (decision.detail.reason || '').toLowerCase().includes(filters.q) ||
+    countryCode.includes(filters.q) ||
+    countryName.includes(filters.q) ||
+    (decision.detail.as || '').toLowerCase().includes(filters.q) ||
+    (machineFeaturesEnabled && machine.includes(filters.q)) ||
+    (decision.detail.type || '').toLowerCase().includes(filters.q) ||
+    (decision.detail.action || '').toLowerCase().includes(filters.q) ||
+    simulationSearch.includes(filters.q);
+}
+
+function matchesSimulationFilter(isSimulated: boolean, filter: string): boolean {
+  if (filter === 'simulated') return isSimulated;
+  if (filter === 'live') return !isSimulated;
+  return true;
+}
+
+function isDecisionListItemExpired(decision: DecisionListItem): boolean {
+  const decisionDuration = decision.detail.duration ?? '';
+  return Boolean(decision.expired || decisionDuration.startsWith('-'));
+}
+
+function getDateFilterKey(isoString: string, includeHour: boolean, timezoneOffsetMinutes: number): string {
+  const source = new Date(isoString);
+  const localDate = new Date(source.getTime() - timezoneOffsetMinutes * 60_000);
+  const year = localDate.getUTCFullYear();
+  const month = String(localDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(localDate.getUTCDate()).padStart(2, '0');
+
+  if (includeHour) {
+    const hour = String(localDate.getUTCHours()).padStart(2, '0');
+    return `${year}-${month}-${day}T${hour}`;
+  }
+
+  return `${year}-${month}-${day}`;
+}
+
+function getCountryName(code?: string | null): string | null {
+  if (!code) return null;
+  try {
+    const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
+    return regionNames.of(code.toUpperCase()) || code;
+  } catch {
+    return code;
+  }
 }

@@ -2,6 +2,20 @@ export interface ApiErrorResponse {
   error: string;
 }
 
+export interface PaginationMeta {
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+  unfiltered_total: number;
+}
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  pagination: PaginationMeta;
+  selectable_ids: Array<string | number>;
+}
+
 export type AlertMetaValue =
   | string
   | number
@@ -152,6 +166,60 @@ export interface StatsDecision {
   stop_at?: string;
   target?: string;
   simulated?: boolean;
+}
+
+export type DashboardGranularity = 'day' | 'hour';
+export type DashboardSimulationFilter = 'all' | 'live' | 'simulated';
+
+export interface DashboardStatsBucket {
+  date: string;
+  count: number;
+  fullDate: string;
+}
+
+export interface DashboardStatListItem {
+  label: string;
+  count: number;
+  value?: string;
+  countryCode?: string;
+}
+
+export interface DashboardWorldMapDatum {
+  label: string;
+  count: number;
+  countryCode: string;
+  simulatedCount?: number;
+  liveCount?: number;
+}
+
+export interface DashboardStatsTotals {
+  alerts: number;
+  decisions: number;
+  simulatedAlerts: number;
+  simulatedDecisions: number;
+}
+
+export interface DashboardStatsSeries {
+  alertsHistory: DashboardStatsBucket[];
+  simulatedAlertsHistory: DashboardStatsBucket[];
+  decisionsHistory: DashboardStatsBucket[];
+  simulatedDecisionsHistory: DashboardStatsBucket[];
+  unfilteredAlertsHistory: DashboardStatsBucket[];
+  unfilteredSimulatedAlertsHistory: DashboardStatsBucket[];
+  unfilteredDecisionsHistory: DashboardStatsBucket[];
+  unfilteredSimulatedDecisionsHistory: DashboardStatsBucket[];
+}
+
+export interface DashboardStatsResponse {
+  totals: DashboardStatsTotals;
+  filteredTotals: DashboardStatsTotals;
+  globalTotal: number;
+  topTargets: DashboardStatListItem[];
+  topCountries: DashboardStatListItem[];
+  allCountries: DashboardWorldMapDatum[];
+  topScenarios: DashboardStatListItem[];
+  topAS: DashboardStatListItem[];
+  series: DashboardStatsSeries;
 }
 
 export interface UpdateCheckResponse {

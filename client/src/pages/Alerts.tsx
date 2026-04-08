@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from "react";
 import { useSearchParams, Link } from "react-router-dom";
-import { fetchAlerts, fetchAlert, deleteAlert, bulkDeleteAlerts, cleanupByIp, fetchConfig } from "../lib/api";
+import { fetchAlertsPaginated, fetchAlert, deleteAlert, bulkDeleteAlerts, cleanupByIp, fetchConfig } from "../lib/api";
 import { isSimulatedAlert, isSimulatedDecision, matchesSimulationFilter, parseSimulationFilter } from "../lib/simulation";
 import { useRefresh } from "../contexts/useRefresh";
 import { Badge } from "../components/ui/Badge";
@@ -24,20 +24,6 @@ interface ErrorInfo {
     message: string;
     helpLink?: string;
     helpText?: string;
-}
-
-function getDateFilterKey(isoString: string, includeHour: boolean): string {
-    const date = new Date(isoString);
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-
-    if (includeHour) {
-        const hour = String(date.getHours()).padStart(2, '0');
-        return `${year}-${month}-${day}T${hour}`;
-    }
-
-    return `${year}-${month}-${day}`;
 }
 
 function toErrorInfo(error: unknown, fallbackMessage: string): ErrorInfo {
@@ -100,9 +86,14 @@ export function Alerts() {
     const [machineFeaturesEnabled, setMachineFeaturesEnabled] = useState(false);
     const [filter, setFilter] = useState("");
     const [loading, setLoading] = useState(true);
+    const [loadingMore, setLoadingMore] = useState(false);
     const [selectedAlert, setSelectedAlert] = useState<AlertSelection | null>(null);
-    const [displayedCount, setDisplayedCount] = useState(50);
     const [displayedDecisionCount, setDisplayedDecisionCount] = useState(50);
+    const [currentPage, setCurrentPage] = useState(1);
+    const [totalPages, setTotalPages] = useState(1);
+    const [totalAlerts, setTotalAlerts] = useState(0);
+    const [totalUnfilteredAlerts, setTotalUnfilteredAlerts] = useState(0);
+    const [selectableAlertIds, setSelectableAlertIds] = useState<string[]>([]);
     const [searchParams, setSearchParams] = useSearchParams();
     const [pendingDeleteAction, setPendingDeleteAction] = useState<AlertDeleteAction | null>(null);
     const [selectedAlertIds, setSelectedAlertIds] = useState<string[]>([]);
@@ -116,30 +107,86 @@ export function Alerts() {
     // Ref to track selected alert ID for auto-refresh (avoids stale closure issues)
     const selectedAlertIdRef = useRef<string | number | null>(null);
 
-    // Intersection Observer for infinite scroll
+    const PAGE_SIZE = 50;
+    const hasMoreAlerts = currentPage < totalPages;
     const observer = useRef<IntersectionObserver | null>(null);
-    const lastAlertElementRef = useCallback((node: HTMLTableRowElement | null) => {
-        if (loading) return;
-        if (observer.current) observer.current.disconnect();
-        observer.current = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting) {
-                setDisplayedCount((prev) => prev + 50);
-            }
-        });
-        if (node) observer.current.observe(node);
-    }, [loading]);
-
     const decisionContainerRef = useRef<HTMLDivElement | null>(null);
     const selectAllAlertsRef = useRef<HTMLInputElement | null>(null);
+    const currentPageRef = useRef(1);
+    const inFlightLoadKeysRef = useRef(new Set<string>());
+    const lastCompletedLoadRef = useRef<{ key: string; completedAt: number } | null>(null);
 
-    const loadAlerts = useCallback(async (isBackground = false) => {
+    const buildServerFilters = useCallback((simulationFilter = currentSimulationFilter): Record<string, string> => {
+        const filters: Record<string, string> = {
+            tz_offset: String(new Date().getTimezoneOffset()),
+        };
+        if (filter) filters.q = filter;
+        for (const key of ["ip", "country", "scenario", "as", "target", "date", "dateStart", "dateEnd"]) {
+            const value = searchParams.get(key);
+            if (value) filters[key] = value;
+        }
+        if (simulationFilter !== 'all') {
+            filters.simulation = simulationFilter;
+        }
+        return filters;
+    }, [currentSimulationFilter, filter, searchParams]);
+
+    const loadAlerts = useCallback(async (isBackground = false, page = 1, append = false, preserveLoadedPages = false) => {
+        const loadKey = JSON.stringify({
+            page,
+            append,
+            preserveLoadedPages,
+            loadedPage: preserveLoadedPages ? currentPageRef.current : undefined,
+            filter,
+            search: searchParams.toString(),
+        });
+        const lastCompletedLoad = lastCompletedLoadRef.current;
+        if (
+            inFlightLoadKeysRef.current.has(loadKey) ||
+            (lastCompletedLoad?.key === loadKey && Date.now() - lastCompletedLoad.completedAt < 250)
+        ) {
+            return;
+        }
+
+        inFlightLoadKeysRef.current.add(loadKey);
+        let completedSuccessfully = false;
+
         try {
-            if (!isBackground) setLoading(true);
-            const [alertsData, configData] = await Promise.all([
-                fetchAlerts(),
-                fetchConfig(),
-            ]);
-            setAlerts(alertsData);
+            if (append) {
+                setLoadingMore(true);
+            } else if (!isBackground) {
+                setLoading(true);
+            }
+            const configData = await fetchConfig();
+            const requestedSimulationFilter = configData.simulations_enabled === true
+                ? parseSimulationFilter(searchParams.get("simulation"))
+                : 'all';
+            const filters = buildServerFilters(requestedSimulationFilter);
+            const alertsResult = await fetchAlertsPaginated(page, PAGE_SIZE, filters);
+            let alertsData = alertsResult.data;
+            let nextPage = alertsResult.pagination.page;
+
+            if (!append && preserveLoadedPages) {
+                const loadedPageCount = Math.max(1, currentPageRef.current);
+                const maxPageToRefresh = Math.max(1, Math.min(loadedPageCount, alertsResult.pagination.total_pages || 1));
+                if (maxPageToRefresh > 1) {
+                    const remainingPages = await Promise.all(
+                        Array.from({ length: maxPageToRefresh - 1 }, (_, index) =>
+                            fetchAlertsPaginated(index + 2, PAGE_SIZE, filters),
+                        ),
+                    );
+                    alertsData = [alertsResult, ...remainingPages].flatMap((result) => result.data);
+                }
+                nextPage = maxPageToRefresh;
+            }
+
+            setAlerts((current) => append ? [...current, ...alertsData] : alertsData);
+            currentPageRef.current = append ? alertsResult.pagination.page : nextPage;
+            setCurrentPage(currentPageRef.current);
+            setTotalPages(alertsResult.pagination.total_pages);
+            setTotalAlerts(alertsResult.pagination.total);
+            setTotalUnfilteredAlerts(alertsResult.pagination.unfiltered_total);
+            setSelectableAlertIds(alertsResult.selectable_ids.map(String));
             setSimulationsEnabled(configData.simulations_enabled === true);
             setMachineFeaturesEnabled(configData.machine_features_enabled === true);
 
@@ -177,13 +224,30 @@ export function Alerts() {
             }
 
             setLastUpdated(new Date());
+            completedSuccessfully = true;
 
         } catch (err) {
             console.error(err);
         } finally {
+            inFlightLoadKeysRef.current.delete(loadKey);
+            if (completedSuccessfully) {
+                lastCompletedLoadRef.current = { key: loadKey, completedAt: Date.now() };
+            }
+            if (append) setLoadingMore(false);
             if (!isBackground) setLoading(false);
         }
-    }, [alertIdParam, queryParam, setLastUpdated]);
+    }, [alertIdParam, buildServerFilters, filter, queryParam, searchParams, setLastUpdated]);
+
+    const lastAlertElementRef = useCallback((node: HTMLTableRowElement | null) => {
+        if (loading || loadingMore || !hasMoreAlerts) return;
+        if (observer.current) observer.current.disconnect();
+        observer.current = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting) {
+                void loadAlerts(true, currentPage + 1, true);
+            }
+        });
+        if (node) observer.current.observe(node);
+    }, [currentPage, hasMoreAlerts, loadAlerts, loading, loadingMore]);
 
     useEffect(() => {
         loadAlerts(false);
@@ -191,7 +255,7 @@ export function Alerts() {
 
 
     useEffect(() => {
-        if (refreshSignal > 0) loadAlerts(true);
+        if (refreshSignal > 0) loadAlerts(true, 1, false, true);
     }, [refreshSignal, loadAlerts]);
 
     // Keep ref in sync with selectedAlert for auto-refresh
@@ -256,8 +320,7 @@ export function Alerts() {
             }
 
             setPendingDeleteAction(null);
-            await loadAlerts();
-            setDisplayedCount(50);
+            await loadAlerts(false, 1, false);
             if (resultMessage) {
                 setErrorInfo({ message: resultMessage });
             }
@@ -282,73 +345,10 @@ export function Alerts() {
         ));
     };
 
-    const filteredAlerts = alerts.filter((alert) => {
-        const search = filter.toLowerCase();
-
-        // Specific query params
-        const paramIp = (searchParams.get("ip") || "").toLowerCase();
-        const paramCountry = (searchParams.get("country") || "").toLowerCase();
-        const paramScenario = (searchParams.get("scenario") || "").toLowerCase();
-        const paramAs = (searchParams.get("as") || "").toLowerCase();
-        const paramDate = searchParams.get("date") || "";
-        const paramDateStart = searchParams.get("dateStart") || "";
-
-        const paramDateEnd = searchParams.get("dateEnd") || "";
-        const paramTarget = (searchParams.get("target") || "").toLowerCase();
-
-        if (!matchesSimulationFilter({ simulated: isSimulatedAlert(alert) }, currentSimulationFilter)) return false;
-
-        const scenario = (alert.scenario || "").toLowerCase();
-        const message = (alert.message || "").toLowerCase();
-        const sourceValue = (getAlertSourceValue(alert.source) || "").toLowerCase();
-        const cn = (alert.source?.cn || "").toLowerCase();
-        const asName = (alert.source?.as_name || "").toLowerCase();
-        const machine = machineFeaturesEnabled ? (resolveMachineName(alert) || "").toLowerCase() : "";
-
-        // Check specific filters if present
-        if (paramIp && !sourceValue.includes(paramIp)) return false;
-        if (paramCountry && !cn.includes(paramCountry)) return false;
-        if (paramScenario && !scenario.includes(paramScenario)) return false;
-        if (paramScenario && !scenario.includes(paramScenario)) return false;
-        if (paramAs && !asName.includes(paramAs)) return false;
-        if (paramTarget && !(alert.target || "").toLowerCase().includes(paramTarget)) return false;
-
-        // Single date filter (legacy support)
-        if (paramDate && !(alert.created_at && alert.created_at.startsWith(paramDate))) return false;
-
-        // Date range filter (dateStart/dateEnd)
-        if (paramDateStart || paramDateEnd) {
-            if (!alert.created_at) return false;
-
-            // Helper to extract date/time key from ISO timestamp
-            const itemKey = getDateFilterKey(alert.created_at, paramDateStart.includes('T') || paramDateEnd.includes('T'));
-
-            if (paramDateStart && itemKey < paramDateStart) return false;
-            if (paramDateEnd && itemKey > paramDateEnd) return false;
-        }
-
-        // Check generic search
-        if (search) {
-            const countryName = (getCountryName(alert.source?.cn) || "").toLowerCase();
-            return scenario.includes(search) ||
-                message.includes(search) ||
-                sourceValue.includes(search) ||
-                cn.includes(search) ||
-                countryName.includes(search) ||
-                asName.includes(search) ||
-                (machineFeaturesEnabled && machine.includes(search)) ||
-                (alert.target || "").toLowerCase().includes(search) ||
-                (alert.meta_search || "").toLowerCase().includes(search) ||
-                (isSimulatedAlert(alert) ? 'simulation simulated' : 'live').includes(search);
-        }
-
-        return true;
-    });
-
-    const filteredAlertIds = filteredAlerts.map((alert) => String(alert.id));
-    const filteredAlertIdsKey = filteredAlertIds.join("|");
-    const selectedFilteredAlertIds = filteredAlertIds.filter((id) => selectedAlertIds.includes(id));
-    const allFilteredAlertsSelected = filteredAlertIds.length > 0 && selectedFilteredAlertIds.length === filteredAlertIds.length;
+    const filteredAlerts = alerts;
+    const filteredAlertIdsKey = selectableAlertIds.join("|");
+    const selectedFilteredAlertIds = selectableAlertIds.filter((id) => selectedAlertIds.includes(id));
+    const allFilteredAlertsSelected = selectableAlertIds.length > 0 && selectedFilteredAlertIds.length === selectableAlertIds.length;
     const someFilteredAlertsSelected = selectedFilteredAlertIds.length > 0 && !allFilteredAlertsSelected;
 
     useEffect(() => {
@@ -365,14 +365,14 @@ export function Alerts() {
     const toggleAllFilteredAlerts = () => {
         setSelectedAlertIds((prev) => {
             if (allFilteredAlertsSelected) {
-                return prev.filter((id) => !filteredAlertIds.includes(id));
+                return prev.filter((id) => !selectableAlertIds.includes(id));
             }
 
-            return Array.from(new Set([...prev, ...filteredAlertIds]));
+            return Array.from(new Set([...prev, ...selectableAlertIds]));
         });
     };
 
-    const visibleAlerts = filteredAlerts.slice(0, displayedCount);
+    const visibleAlerts = filteredAlerts;
     const selectedAlertDecisions = selectedAlert?.decisions ?? [];
     const visibleSelectedAlertDecisions = selectedAlertDecisions.slice(0, displayedDecisionCount);
     const selectedAlertEvents = selectedAlert && hasAlertEvents(selectedAlert) ? selectedAlert.events ?? [] : [];
@@ -391,9 +391,11 @@ export function Alerts() {
 
     return (
         <div className="space-y-6">
-            {(filteredAlerts.length !== alerts.length) && (
+            {(totalAlerts !== totalUnfilteredAlerts || visibleAlerts.length < totalAlerts) && (
                 <div className="text-sm text-gray-500">
-                    Showing {filteredAlerts.length} of {alerts.length} alerts
+                    {totalAlerts !== totalUnfilteredAlerts
+                        ? `Showing ${visibleAlerts.length} of ${totalAlerts} alerts (${totalUnfilteredAlerts} total before filters)`
+                        : `Showing ${visibleAlerts.length} of ${totalAlerts} alerts`}
                 </div>
             )}
 
@@ -504,7 +506,7 @@ export function Alerts() {
                                         type="checkbox"
                                         aria-label="Select all filtered alerts"
                                         checked={allFilteredAlertsSelected}
-                                        disabled={filteredAlertIds.length === 0}
+                                        disabled={selectableAlertIds.length === 0}
                                         onChange={toggleAllFilteredAlerts}
                                         className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
                                     />
