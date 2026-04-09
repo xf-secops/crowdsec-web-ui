@@ -32,6 +32,8 @@ import type {
   UpdateCheckResponse,
 } from '../shared/contracts';
 import { normalizeMachineId, resolveMachineName } from '../shared/machine';
+import { collectDistinctOrigins, normalizeOrigin } from '../shared/origin';
+import { compileAlertSearch, compileDecisionSearch, type SearchParseError } from '../shared/search';
 import { createRuntimeConfig, getIntervalName, parseRefreshInterval, type RuntimeConfig } from './config';
 import { CrowdsecDatabase, type AlertInsertParams, type DecisionInsertParams } from './database';
 import { LapiClient } from './lapi';
@@ -200,7 +202,6 @@ interface DashboardDecisionAccumulator {
   liveDecisionBuckets: Map<string, number>;
   simulatedDecisionBuckets: Map<string, number>;
 }
-
 const NOTIFICATION_SECRET_KEY_META_KEY = 'notification_secret_key';
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const UNFILTERED_ALERT_ORIGIN_TOKENS = new Set(['none']);
@@ -334,7 +335,18 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       if (pageRequest) {
         const filters = getAlertListFilters(context);
         const machineFeaturesEnabled = isMachineFeatureEnabled();
-        const filteredAlerts = alerts.filter((alert) => matchesAlertListFilters(alert, filters, machineFeaturesEnabled));
+        const originFeaturesEnabled = isOriginFeatureEnabled();
+        const compiledSearch = compileAlertSearch(filters.q, {
+          machineEnabled: machineFeaturesEnabled,
+          originEnabled: originFeaturesEnabled,
+        });
+        if (!compiledSearch.ok) {
+          return context.json(toSearchErrorResponse(compiledSearch.error), 400);
+        }
+        const filteredAlerts = alerts.filter((alert) =>
+          matchesAlertListFilters(alert, filters, machineFeaturesEnabled) &&
+          compiledSearch.predicate(alert),
+        );
         return context.json(toPaginatedResponse(
           filteredAlerts,
           pageRequest,
@@ -454,7 +466,18 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       if (pageRequest) {
         const filters = getDecisionListFilters(context);
         const machineFeaturesEnabled = isMachineFeatureEnabled();
-        const filteredDecisions = decisions.filter((decision) => matchesDecisionListFilters(decision, filters, machineFeaturesEnabled));
+        const originFeaturesEnabled = isOriginFeatureEnabled();
+        const compiledSearch = compileDecisionSearch(filters.q, {
+          machineEnabled: machineFeaturesEnabled,
+          originEnabled: originFeaturesEnabled,
+        });
+        if (!compiledSearch.ok) {
+          return context.json(toSearchErrorResponse(compiledSearch.error), 400);
+        }
+        const filteredDecisions = decisions.filter((decision) =>
+          matchesDecisionListFilters(decision, filters, machineFeaturesEnabled) &&
+          compiledSearch.predicate(decision),
+        );
         return context.json(toPaginatedResponse(
           filteredDecisions,
           pageRequest,
@@ -484,6 +507,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       sync_status: syncStatus,
       simulations_enabled: config.simulationsEnabled,
       machine_features_enabled: isMachineFeatureEnabled(),
+      origin_features_enabled: isOriginFeatureEnabled(),
     };
 
     return context.json(payload);
@@ -995,7 +1019,9 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       }
     }
 
+    const currentDecisionIds: string[] = [];
     for (const decision of normalizedDecisions) {
+      currentDecisionIds.push(String(decision.id));
       const createdAt = decision.created_at || alert.created_at;
       const stopAt = decision.duration
         ? new Date(Date.now() + parseGoDuration(decision.duration)).toISOString()
@@ -1037,6 +1063,8 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         console.error(`Failed to insert decision ${decision.id}:`, error.message);
       }
     }
+
+    database.deleteDecisionsByAlertIdExcept(alert.id, currentDecisionIds);
   }
 
   async function syncHistory(): Promise<number> {
@@ -1186,37 +1214,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       if (activeDecisionAlerts.length > 0) {
         const refreshTransaction = database.transaction<AlertRecord[]>((alerts) => {
           for (const alert of alerts) {
-            for (const decision of alert.decisions || []) {
-              const createdAt = decision.created_at || alert.created_at;
-              const stopAt = decision.duration
-                ? new Date(Date.now() + parseGoDuration(decision.duration)).toISOString()
-                : decision.stop_at || createdAt;
-
-              const alertSource = alert.source || null;
-              const sourceValue = getAlertSourceValue(alertSource);
-              const machine = resolveMachineName(alert);
-              const enrichedDecision = {
-                ...decision,
-                created_at: createdAt,
-                stop_at: stopAt,
-                scenario: decision.scenario || alert.scenario || 'unknown',
-                origin: decision.origin || decision.scenario || alert.scenario || 'unknown',
-                alert_id: alert.id,
-                value: decision.value || sourceValue,
-                type: decision.type || 'ban',
-                country: alertSource?.cn,
-                as: alertSource?.as_name,
-                machine,
-                target: getAlertTarget(alert),
-                simulated: normalizeDecisionSimulated(decision, alert),
-              };
-
-              database.updateDecision({
-                $id: String(decision.id),
-                $stop_at: stopAt,
-                $raw_data: JSON.stringify(enrichedDecision),
-              });
-            }
+            processAlertForDatabase(alert);
           }
         });
         refreshTransaction(activeDecisionAlerts);
@@ -1952,7 +1950,6 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       },
     };
   }
-
   function normalizeAlertDetail(input: unknown, alertId: string): AlertRecord | null {
     if (Array.isArray(input)) {
       const matchingAlert = input.find((candidate) => String((candidate as AlertRecord | undefined)?.id) === alertId);
@@ -2012,6 +2009,33 @@ export function createApp(options: CreateAppOptions = {}): AppController {
         }
       } catch (error) {
         console.error('Failed to parse cached alert while evaluating machine visibility:', error);
+      }
+    }
+
+    return false;
+  }
+
+  function isOriginFeatureEnabled(): boolean {
+    if (config.alwaysShowOrigin) {
+      return true;
+    }
+
+    const since = new Date(Date.now() - config.lookbackMs).toISOString();
+    const now = new Date().toISOString();
+    const origins = new Set<string>();
+
+    for (const row of database.getDecisionsSince(since, now)) {
+      try {
+        const decision = JSON.parse(row.raw_data) as AlertDecision;
+        const origin = normalizeOrigin(decision.origin);
+        if (!origin) continue;
+
+        origins.add(origin);
+        if (origins.size > 1) {
+          return true;
+        }
+      } catch (error) {
+        console.error('Failed to parse cached decision while evaluating origin visibility:', error);
       }
     }
 
@@ -2265,7 +2289,7 @@ function toPaginatedResponse<T>(
 
 function getAlertListFilters(context: HonoContext): AlertListFilters {
   return {
-    q: lowerQuery(context, 'q'),
+    q: context.req.query('q') || '',
     ip: lowerQuery(context, 'ip'),
     country: lowerQuery(context, 'country'),
     scenario: lowerQuery(context, 'scenario'),
@@ -2282,7 +2306,7 @@ function getAlertListFilters(context: HonoContext): AlertListFilters {
 function getDecisionListFilters(context: HonoContext): DecisionListFilters {
   const alertId = context.req.query('alert_id') || '';
   return {
-    q: lowerQuery(context, 'q'),
+    q: context.req.query('q') || '',
     alertId,
     country: context.req.query('country') || '',
     scenario: context.req.query('scenario') || '',
@@ -2580,9 +2604,15 @@ function addDashboardBucketInterval(date: Date, granularity: DashboardGranularit
 function getDashboardBucketFullDate(key: string, timezoneOffsetMinutes: number): string {
   return parseDashboardBucketKey(key, timezoneOffsetMinutes).toISOString();
 }
-
 function lowerQuery(context: HonoContext, key: string): string {
   return (context.req.query(key) || '').toLowerCase();
+}
+
+function toSearchErrorResponse(error: SearchParseError): { error: string; details: SearchParseError } {
+  return {
+    error: error.message,
+    details: error,
+  };
 }
 
 function parseTimezoneOffset(context: HonoContext): number {
@@ -2594,11 +2624,9 @@ function matchesAlertListFilters(alert: SlimAlert, filters: AlertListFilters, ma
   if (!matchesSimulationFilter(alert.simulated === true, filters.simulation)) return false;
 
   const scenario = (alert.scenario || '').toLowerCase();
-  const message = (alert.message || '').toLowerCase();
   const sourceValue = (getAlertSourceValue(alert.source) || '').toLowerCase();
   const cn = (alert.source?.cn || '').toLowerCase();
   const asName = (alert.source?.as_name || '').toLowerCase();
-  const machine = machineFeaturesEnabled ? (resolveMachineName(alert) || '').toLowerCase() : '';
   const target = (alert.target || '').toLowerCase();
 
   if (filters.ip && !sourceValue.includes(filters.ip)) return false;
@@ -2618,22 +2646,10 @@ function matchesAlertListFilters(alert: SlimAlert, filters: AlertListFilters, ma
     if (filters.dateEnd && itemKey > filters.dateEnd) return false;
   }
 
-  if (!filters.q) return true;
-
-  const countryName = (getCountryName(alert.source?.cn) || '').toLowerCase();
-  return scenario.includes(filters.q) ||
-    message.includes(filters.q) ||
-    sourceValue.includes(filters.q) ||
-    cn.includes(filters.q) ||
-    countryName.includes(filters.q) ||
-    asName.includes(filters.q) ||
-    (machineFeaturesEnabled && machine.includes(filters.q)) ||
-    target.includes(filters.q) ||
-    (alert.meta_search || '').toLowerCase().includes(filters.q) ||
-    (alert.simulated === true ? 'simulation simulated' : 'live').includes(filters.q);
+  return true;
 }
 
-function matchesDecisionListFilters(decision: DecisionListItem, filters: DecisionListFilters, machineFeaturesEnabled: boolean): boolean {
+function matchesDecisionListFilters(decision: DecisionListItem, filters: DecisionListFilters, _machineFeaturesEnabled: boolean): boolean {
   if (!filters.showDuplicates && decision.is_duplicate) return false;
   if (filters.alertId && String(decision.detail.alert_id) !== filters.alertId) return false;
   if (!matchesSimulationFilter(decision.simulated === true, filters.simulation)) return false;
@@ -2659,22 +2675,7 @@ function matchesDecisionListFilters(decision: DecisionListItem, filters: Decisio
     if (filters.dateEnd && itemKey > filters.dateEnd) return false;
   }
 
-  if (!filters.q) return true;
-
-  const countryCode = (decision.detail.country || '').toLowerCase();
-  const countryName = (getCountryName(decision.detail.country) || '').toLowerCase();
-  const machine = machineFeaturesEnabled ? (decision.machine || '').toLowerCase() : '';
-  const simulationSearch = decision.simulated === true ? 'simulation simulated' : 'live';
-
-  return (decision.value || '').toLowerCase().includes(filters.q) ||
-    (decision.detail.reason || '').toLowerCase().includes(filters.q) ||
-    countryCode.includes(filters.q) ||
-    countryName.includes(filters.q) ||
-    (decision.detail.as || '').toLowerCase().includes(filters.q) ||
-    (machineFeaturesEnabled && machine.includes(filters.q)) ||
-    (decision.detail.type || '').toLowerCase().includes(filters.q) ||
-    (decision.detail.action || '').toLowerCase().includes(filters.q) ||
-    simulationSearch.includes(filters.q);
+  return true;
 }
 
 function matchesSimulationFilter(isSimulated: boolean, filter: string): boolean {

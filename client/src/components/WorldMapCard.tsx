@@ -438,7 +438,8 @@ export function WorldMapCard({ data, onCountrySelect, selectedCountry, simulatio
                             maxScale={8}
                             centerOnInit={true}
                             centerZoomedOut={false}
-                            wheel={{ step: 0.1 }}
+                            smooth={false}
+                            wheel={{ step: 0.15 }}
                             panning={{ velocityDisabled: true }}
                             doubleClick={{ mode: 'zoomIn', step: 0.7 }}
                             limitToBounds={false}
@@ -496,10 +497,9 @@ export function WorldMapCard({ data, onCountrySelect, selectedCountry, simulatio
                                             <RotateCcw className="w-4 h-4 text-gray-600 dark:text-gray-300" />
                                         </button>
                                     </div>
-                                    <TransformComponent wrapperStyle={{ width: '100%', height: '100%' }} contentStyle={{ width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                            <TransformComponent wrapperStyle={{ width: '100%', height: '100%' }} contentStyle={{ width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                                         <div style={{ width: mapWidth, height: mapHeight }}>
                                             <Choropleth
-                                                key={`choropleth-${selectedCountry || 'none'}`}
                                                 width={mapWidth}
                                                 height={mapHeight}
                                                 data={nivoData}

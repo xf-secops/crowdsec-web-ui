@@ -567,8 +567,14 @@ describe('createApp', () => {
       lookback_period: string;
       simulations_enabled: boolean;
       machine_features_enabled: boolean;
+      origin_features_enabled: boolean;
     })).toEqual(
-      expect.objectContaining({ lookback_period: '1m', simulations_enabled: true, machine_features_enabled: false }),
+      expect.objectContaining({
+        lookback_period: '1m',
+        simulations_enabled: true,
+        machine_features_enabled: false,
+        origin_features_enabled: true,
+      }),
     );
 
     const alerts = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
@@ -784,6 +790,22 @@ describe('createApp', () => {
     expect(((await response.json()) as { machine_features_enabled: boolean }).machine_features_enabled).toBe(true);
   });
 
+  test('reports origin features enabled immediately when always-show override is configured', async () => {
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_ALWAYS_SHOW_ORIGIN: 'true',
+      },
+    });
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { origin_features_enabled: boolean }).origin_features_enabled).toBe(true);
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
   test('enables machine features after multiple machine ids are observed and includes machine in decision payloads', async () => {
     const firstAlert = sampleAlert({
       id: 101,
@@ -884,6 +906,205 @@ describe('createApp', () => {
 
     const configResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
     expect(((await configResponse.json()) as { machine_features_enabled: boolean }).machine_features_enabled).toBe(false);
+  });
+
+  test('enables origin features after multiple decision origins are observed', async () => {
+    const { controller, database } = createController();
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      decisions: [{ id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false }],
+    }));
+    seedAlert(database, sampleAlert({
+      id: 2,
+      uuid: 'alert-2',
+      source: { ip: '5.6.7.8', value: '5.6.7.8', cn: 'US', as_name: 'AWS' },
+      decisions: [{ id: 20, value: '5.6.7.8', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'CAPI', simulated: false }],
+    }));
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { origin_features_enabled: boolean }).origin_features_enabled).toBe(true);
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('keeps origin features disabled when only one cached decision origin exists', async () => {
+    const { controller, database } = createController();
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      decisions: [{ id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false }],
+    }));
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { origin_features_enabled: boolean }).origin_features_enabled).toBe(false);
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('matches alert search queries against decision origins', async () => {
+    const { controller, database } = createController();
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      decisions: [
+        { id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false },
+        { id: 11, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'CAPI', simulated: false },
+      ],
+    }));
+    seedAlert(database, sampleAlert({
+      id: 2,
+      uuid: 'alert-2',
+      source: { ip: '5.6.7.8', value: '5.6.7.8', cn: 'US', as_name: 'AWS' },
+      decisions: [{ id: 20, value: '5.6.7.8', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'crowdsec', simulated: false }],
+    }));
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=capi'));
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('matches decision search queries against machine and origin', async () => {
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_ALWAYS_SHOW_MACHINE: 'true',
+      },
+    });
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      machine_id: 'machine-1',
+      machine_alias: 'host-a',
+      decisions: [{ id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false }],
+    }));
+    seedAlert(database, sampleAlert({
+      id: 2,
+      uuid: 'alert-2',
+      source: { ip: '5.6.7.8', value: '5.6.7.8', cn: 'US', as_name: 'AWS' },
+      decisions: [{ id: 20, value: '5.6.7.8', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'crowdsec', simulated: false }],
+    }));
+
+    const machineResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=host-a'));
+    expect(machineResponse.status).toBe(200);
+    expect((await machineResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 10 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const originResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=manual'));
+    expect(originResponse.status).toBe(200);
+    expect((await originResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 10 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('supports advanced boolean search for alerts and decisions', async () => {
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_ALWAYS_SHOW_MACHINE: 'true',
+        CROWDSEC_ALWAYS_SHOW_ORIGIN: 'true',
+      },
+    });
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      machine_id: 'machine-1',
+      machine_alias: 'host-a',
+      source: { ip: '1.2.3.4', value: '1.2.3.4', cn: 'DE', as_name: 'Hetzner' },
+      decisions: [
+        { id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false },
+        { id: 11, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'CAPI', simulated: false },
+      ],
+    }));
+    seedAlert(database, sampleAlert({
+      id: 2,
+      uuid: 'alert-2',
+      machine_id: 'machine-2',
+      machine_alias: 'host-b',
+      source: { ip: '5.6.7.8', value: '5.6.7.8', cn: 'US', as_name: 'AWS' },
+      decisions: [{ id: 20, value: '5.6.7.8', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'crowdsec', simulated: true }],
+      simulated: true,
+    }));
+
+    const alertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=origin:(manual%20OR%20CAPI)%20AND%20-country:us'));
+    expect(alertsResponse.status).toBe(200);
+    expect((await alertsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const decisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=status:active%20AND%20alert:1%20AND%20duplicate:false'));
+    expect(decisionsResponse.status).toBe(200);
+    expect((await decisionsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 10 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('returns a 400 for invalid advanced search queries', async () => {
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_ALWAYS_SHOW_ORIGIN: 'true',
+      },
+    });
+
+    seedAlert(database, sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      decisions: [{ id: 10, value: '1.2.3.4', stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(), type: 'ban', origin: 'manual', simulated: false }],
+    }));
+
+    const response = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=origin:(manual%20OR'));
+    expect(response.status).toBe(400);
+    expect((await response.json()) as { error: string; details: { position: number } }).toEqual(
+      expect.objectContaining({
+        error: expect.stringContaining('Missing closing parenthesis'),
+        details: expect.objectContaining({
+          position: expect.any(Number),
+        }),
+      }),
+    );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
   });
 
   test('validates bad ids and malformed input', async () => {
@@ -1325,6 +1546,216 @@ describe('createApp', () => {
 
     const configResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
     expect(((await configResponse.json()) as { simulations_enabled: boolean }).simulations_enabled).toBe(false);
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('keeps alerts and decisions endpoints consistent when sync repairs stale cached decisions', async () => {
+    const createdAt = new Date().toISOString();
+    const stopAt = new Date(Date.now() + 30 * 60 * 1_000).toISOString();
+    const syncedAlert = sampleAlert({
+      id: 200,
+      uuid: 'alert-200',
+      created_at: createdAt,
+      source: {
+        ip: '2.2.2.2',
+        value: '2.2.2.2',
+        cn: 'DE',
+        as_name: 'Hetzner',
+      },
+      decisions: [
+        {
+          id: 2001,
+          type: 'ban',
+          value: '2.2.2.2',
+          duration: '30m',
+          stop_at: stopAt,
+          origin: 'manual',
+          scenario: 'crowdsecurity/ssh-bf',
+          simulated: false,
+        },
+      ],
+      simulated: false,
+    });
+
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_REFRESH_INTERVAL: '0',
+      },
+      fetchResolver: (url) => {
+        if (url.endsWith('/v1/watchers/login')) {
+          return Response.json({ code: 200, token: 'token' });
+        }
+        if (url.includes('/v1/alerts?')) {
+          return Response.json([syncedAlert]);
+        }
+        return undefined;
+      },
+    });
+
+    seedAlert(database, syncedAlert);
+    database.insertDecision({
+      $id: '2999',
+      $uuid: '2999',
+      $alert_id: 200,
+      $created_at: createdAt,
+      $stop_at: new Date(Date.now() + 45 * 60 * 1_000).toISOString(),
+      $value: '2.2.2.2',
+      $type: 'ban',
+      $origin: 'manual',
+      $scenario: 'crowdsecurity/ssh-bf',
+      $raw_data: JSON.stringify({
+        id: 2999,
+        created_at: createdAt,
+        scenario: 'crowdsecurity/ssh-bf',
+        value: '2.2.2.2',
+        stop_at: new Date(Date.now() + 45 * 60 * 1_000).toISOString(),
+        type: 'ban',
+        origin: 'manual',
+        country: 'DE',
+        as: 'Hetzner',
+        target: 'ssh',
+        alert_id: 200,
+        simulated: false,
+      }),
+    });
+
+    const alertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=50'));
+    expect(alertsResponse.status).toBe(200);
+    const alertsJson = await alertsResponse.json() as {
+      data: Array<{ id: number; decisions: Array<{ id: number; expired?: boolean }> }>;
+    };
+    const alertRow = alertsJson.data.find((alert) => alert.id === 200);
+    expect(alertRow?.decisions.filter((decision) => decision.expired !== true)).toHaveLength(1);
+
+    const decisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=50&alert_id=200&include_expired=true'));
+    expect(decisionsResponse.status).toBe(200);
+    const decisionsJson = await decisionsResponse.json() as {
+      data: Array<{ id: number }>;
+      pagination: { total: number };
+    };
+    expect(decisionsJson.pagination.total).toBe(1);
+    expect(decisionsJson.data.map((decision) => decision.id)).toEqual([2001]);
+    expect(database.getDecisionById('2999')).toBeNull();
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('removes stale decisions during active-decision delta refresh and updates alert payloads to match', async () => {
+    const createdAt = new Date().toISOString();
+    const initialStopAt = new Date(Date.now() + 30 * 60 * 1_000).toISOString();
+    const staleStopAt = new Date(Date.now() + 45 * 60 * 1_000).toISOString();
+    const initialAlert = sampleAlert({
+      id: 210,
+      uuid: 'alert-210',
+      created_at: createdAt,
+      source: {
+        ip: '3.3.3.3',
+        value: '3.3.3.3',
+        cn: 'US',
+        as_name: 'DigitalOcean',
+      },
+      decisions: [
+        {
+          id: 2101,
+          type: 'ban',
+          value: '3.3.3.3',
+          duration: '30m',
+          stop_at: initialStopAt,
+          origin: 'manual',
+          scenario: 'crowdsecurity/http-probing',
+          simulated: false,
+        },
+        {
+          id: 2102,
+          type: 'ban',
+          value: '3.3.3.3',
+          duration: '45m',
+          stop_at: staleStopAt,
+          origin: 'manual',
+          scenario: 'crowdsecurity/http-probing',
+          simulated: false,
+        },
+      ],
+      simulated: false,
+    });
+    const refreshedAlert = sampleAlert({
+      id: 210,
+      uuid: 'alert-210',
+      created_at: createdAt,
+      source: initialAlert.source,
+      decisions: [
+        {
+          id: 2101,
+          type: 'ban',
+          value: '3.3.3.3',
+          duration: '30m',
+          stop_at: initialStopAt,
+          origin: 'manual',
+          scenario: 'crowdsecurity/http-probing',
+          simulated: false,
+        },
+      ],
+      simulated: false,
+    });
+    let phase: 'initial' | 'delta' = 'initial';
+
+    const { controller, database } = createController({
+      env: {
+        CROWDSEC_REFRESH_INTERVAL: '0',
+      },
+      fetchResolver: (url) => {
+        if (url.endsWith('/v1/watchers/login')) {
+          return Response.json({ code: 200, token: 'token' });
+        }
+        if (url.includes('/v1/alerts?')) {
+          if (phase === 'initial') {
+            return Response.json([initialAlert]);
+          }
+          if (url.includes('has_active_decision=true')) {
+            return Response.json([refreshedAlert]);
+          }
+          return Response.json([]);
+        }
+        return undefined;
+      },
+    });
+
+    const initialAlertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=50'));
+    expect(initialAlertsResponse.status).toBe(200);
+
+    const initialDecisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=50&alert_id=210&include_expired=true'));
+    expect(initialDecisionsResponse.status).toBe(200);
+    const initialDecisionsJson = await initialDecisionsResponse.json() as {
+      data: Array<{ id: number }>;
+      pagination: { total: number };
+    };
+    expect(initialDecisionsJson.pagination.total).toBe(2);
+    expect(initialDecisionsJson.data.map((decision) => decision.id).sort()).toEqual([2101, 2102]);
+
+    phase = 'delta';
+
+    const refreshedAlertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts?page=1&page_size=50'));
+    expect(refreshedAlertsResponse.status).toBe(200);
+    const refreshedAlertsJson = await refreshedAlertsResponse.json() as {
+      data: Array<{ id: number; decisions: Array<{ id: number; expired?: boolean }> }>;
+    };
+    const refreshedAlertRow = refreshedAlertsJson.data.find((alert) => alert.id === 210);
+    expect(refreshedAlertRow?.decisions.filter((decision) => decision.expired !== true).map((decision) => decision.id)).toEqual([2101]);
+
+    const refreshedDecisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=50&alert_id=210&include_expired=true'));
+    expect(refreshedDecisionsResponse.status).toBe(200);
+    const refreshedDecisionsJson = await refreshedDecisionsResponse.json() as {
+      data: Array<{ id: number }>;
+      pagination: { total: number };
+    };
+    expect(refreshedDecisionsJson.pagination.total).toBe(1);
+    expect(refreshedDecisionsJson.data.map((decision) => decision.id)).toEqual([2101]);
+    expect(database.getDecisionById('2102')).toBeNull();
 
     controller.stopBackgroundTasks();
     database.close();

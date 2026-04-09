@@ -1,17 +1,20 @@
-import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from "react";
 import { useSearchParams, Link } from "react-router-dom";
-import { fetchAlertsPaginated, fetchAlert, deleteAlert, bulkDeleteAlerts, cleanupByIp, fetchConfig } from "../lib/api";
+import { fetchAlertsPaginated, fetchAlert, deleteAlert, bulkDeleteAlerts, cleanupByIp, fetchConfig, fetchDecisionsPaginated } from "../lib/api";
 import { isSimulatedAlert, isSimulatedDecision, matchesSimulationFilter, parseSimulationFilter } from "../lib/simulation";
 import { useRefresh } from "../contexts/useRefresh";
 import { Badge } from "../components/ui/Badge";
 import { Modal } from "../components/ui/Modal";
+import { SearchSyntaxModal } from "../components/SearchSyntaxModal";
 import { ScenarioName } from "../components/ScenarioName";
 import { TimeDisplay } from "../components/TimeDisplay";
 import { EventCard } from "../components/EventCard";
 import { getCountryName } from "../lib/utils";
 import { resolveMachineName } from "../../../shared/machine";
+import { collectDistinctOrigins, getOriginDisplayValue, getOriginTitle } from "../../../shared/origin";
+import { compileAlertSearch, getSearchHelpDefinition, type SearchParseError } from "../../../shared/search";
 import { Search, Info, ExternalLink, Shield, ShieldBan, Trash2, X, AlertCircle } from "lucide-react";
-import type { AlertRecord, AlertSource, ApiPermissionError, BulkDeleteResult, SimulationFilter, SlimAlert } from '../types';
+import type { AlertRecord, AlertSource, ApiPermissionError, BulkDeleteResult, DecisionListItem, SimulationFilter, SlimAlert } from '../types';
 
 type AlertListItem = SlimAlert;
 type AlertSelection = AlertListItem | AlertRecord;
@@ -84,11 +87,23 @@ export function Alerts() {
     const [alerts, setAlerts] = useState<AlertListItem[]>([]);
     const [simulationsEnabled, setSimulationsEnabled] = useState(false);
     const [machineFeaturesEnabled, setMachineFeaturesEnabled] = useState(false);
-    const [filter, setFilter] = useState("");
-    const [loading, setLoading] = useState(true);
+    const [originFeaturesEnabled, setOriginFeaturesEnabled] = useState(false);
+    const [searchDraft, setSearchDraft] = useState("");
+    const [debouncedSearchDraft, setDebouncedSearchDraft] = useState("");
+    const [appliedQuery, setAppliedQuery] = useState("");
+    const [queryError, setQueryError] = useState<SearchParseError | null>(null);
+    const [showSearchSyntaxModal, setShowSearchSyntaxModal] = useState(false);
+    const [initialLoading, setInitialLoading] = useState(true);
+    const [backgroundLoading, setBackgroundLoading] = useState(false);
     const [loadingMore, setLoadingMore] = useState(false);
     const [selectedAlert, setSelectedAlert] = useState<AlertSelection | null>(null);
-    const [displayedDecisionCount, setDisplayedDecisionCount] = useState(50);
+    const [modalDecisions, setModalDecisions] = useState<DecisionListItem[]>([]);
+    const [modalDecisionsLoading, setModalDecisionsLoading] = useState(false);
+    const [modalDecisionsLoadingMore, setModalDecisionsLoadingMore] = useState(false);
+    const [modalDecisionsPage, setModalDecisionsPage] = useState(1);
+    const [modalDecisionsTotalPages, setModalDecisionsTotalPages] = useState(1);
+    const [modalDecisionsTotal, setModalDecisionsTotal] = useState(0);
+    const [modalDecisionsRefreshToken, setModalDecisionsRefreshToken] = useState(0);
     const [currentPage, setCurrentPage] = useState(1);
     const [totalPages, setTotalPages] = useState(1);
     const [totalAlerts, setTotalAlerts] = useState(0);
@@ -111,16 +126,44 @@ export function Alerts() {
     const hasMoreAlerts = currentPage < totalPages;
     const observer = useRef<IntersectionObserver | null>(null);
     const decisionContainerRef = useRef<HTMLDivElement | null>(null);
+    const modalDecisionObserverRef = useRef<IntersectionObserver | null>(null);
     const selectAllAlertsRef = useRef<HTMLInputElement | null>(null);
+    const previousSelectedAlertIdRef = useRef<string | null>(null);
+    const modalSelectedAlertIdRef = useRef<string | null>(null);
     const currentPageRef = useRef(1);
     const inFlightLoadKeysRef = useRef(new Set<string>());
     const lastCompletedLoadRef = useRef<{ key: string; completedAt: number } | null>(null);
+    const modalDecisionsLoadRef = useRef<{ alertId: string | null; page: number | null }>({ alertId: null, page: null });
+    const loadAlertsRef = useRef<(options?: {
+        isBackground?: boolean;
+        page?: number;
+        append?: boolean;
+        preserveLoadedPages?: boolean;
+        refreshConfig?: boolean;
+    }) => Promise<void>>(async () => {});
+    const lastRefreshSignalRef = useRef(refreshSignal);
+    const configRef = useRef<{
+        simulationsEnabled: boolean;
+        machineFeaturesEnabled: boolean;
+        originFeaturesEnabled: boolean;
+    } | null>(null);
+    const hasLoadedAlertsRef = useRef(false);
+    const searchInputRef = useRef<HTMLInputElement | null>(null);
+    const searchValidationFeatures = useMemo(() => (
+        configRef.current
+            ? { machineEnabled: machineFeaturesEnabled, originEnabled: originFeaturesEnabled }
+            : { machineEnabled: true, originEnabled: true }
+    ), [machineFeaturesEnabled, originFeaturesEnabled]);
+    const searchHelp = useMemo(
+        () => getSearchHelpDefinition('alerts', searchValidationFeatures),
+        [searchValidationFeatures],
+    );
 
     const buildServerFilters = useCallback((simulationFilter = currentSimulationFilter): Record<string, string> => {
         const filters: Record<string, string> = {
             tz_offset: String(new Date().getTimezoneOffset()),
         };
-        if (filter) filters.q = filter;
+        if (appliedQuery) filters.q = appliedQuery;
         for (const key of ["ip", "country", "scenario", "as", "target", "date", "dateStart", "dateEnd"]) {
             const value = searchParams.get(key);
             if (value) filters[key] = value;
@@ -129,16 +172,49 @@ export function Alerts() {
             filters.simulation = simulationFilter;
         }
         return filters;
-    }, [currentSimulationFilter, filter, searchParams]);
+    }, [appliedQuery, currentSimulationFilter, searchParams]);
 
-    const loadAlerts = useCallback(async (isBackground = false, page = 1, append = false, preserveLoadedPages = false) => {
+    const loadConfig = useCallback(async (refresh = false) => {
+        if (!refresh && configRef.current) {
+            return configRef.current;
+        }
+
+        const configData = await fetchConfig();
+        const nextConfig = {
+            simulationsEnabled: configData.simulations_enabled === true,
+            machineFeaturesEnabled: configData.machine_features_enabled === true,
+            originFeaturesEnabled: configData.origin_features_enabled === true,
+        };
+
+        configRef.current = nextConfig;
+        setSimulationsEnabled(nextConfig.simulationsEnabled);
+        setMachineFeaturesEnabled(nextConfig.machineFeaturesEnabled);
+        setOriginFeaturesEnabled(nextConfig.originFeaturesEnabled);
+
+        return nextConfig;
+    }, []);
+
+    const loadAlerts = useCallback(async ({
+        isBackground = false,
+        page = 1,
+        append = false,
+        preserveLoadedPages = false,
+        refreshConfig = false,
+    }: {
+        isBackground?: boolean;
+        page?: number;
+        append?: boolean;
+        preserveLoadedPages?: boolean;
+        refreshConfig?: boolean;
+    } = {}) => {
         const loadKey = JSON.stringify({
             page,
             append,
             preserveLoadedPages,
             loadedPage: preserveLoadedPages ? currentPageRef.current : undefined,
-            filter,
+            filter: appliedQuery,
             search: searchParams.toString(),
+            refreshConfig,
         });
         const lastCompletedLoad = lastCompletedLoadRef.current;
         if (
@@ -150,15 +226,18 @@ export function Alerts() {
 
         inFlightLoadKeysRef.current.add(loadKey);
         let completedSuccessfully = false;
+        const shouldBlockWithInitialLoading = !append && !isBackground && !hasLoadedAlertsRef.current;
 
         try {
             if (append) {
                 setLoadingMore(true);
-            } else if (!isBackground) {
-                setLoading(true);
+            } else if (shouldBlockWithInitialLoading) {
+                setInitialLoading(true);
+            } else {
+                setBackgroundLoading(true);
             }
-            const configData = await fetchConfig();
-            const requestedSimulationFilter = configData.simulations_enabled === true
+            const configData = await loadConfig(refreshConfig || !configRef.current);
+            const requestedSimulationFilter = configData.simulationsEnabled === true
                 ? parseSimulationFilter(searchParams.get("simulation"))
                 : 'all';
             const filters = buildServerFilters(requestedSimulationFilter);
@@ -187,8 +266,7 @@ export function Alerts() {
             setTotalAlerts(alertsResult.pagination.total);
             setTotalUnfilteredAlerts(alertsResult.pagination.unfiltered_total);
             setSelectableAlertIds(alertsResult.selectable_ids.map(String));
-            setSimulationsEnabled(configData.simulations_enabled === true);
-            setMachineFeaturesEnabled(configData.machine_features_enabled === true);
+            hasLoadedAlertsRef.current = true;
 
             // Check if there's an alert ID in the URL
             if (alertIdParam) {
@@ -196,6 +274,7 @@ export function Alerts() {
                 try {
                     const alertData = await fetchAlert(alertIdParam);
                     setSelectedAlert(alertData);
+                    setModalDecisionsRefreshToken((current) => current + 1);
                 } catch (err) {
                     console.error("Alert not found", err);
                     // Fallback to slim data from list if fetch fails
@@ -211,16 +290,12 @@ export function Alerts() {
                     try {
                         const fullAlert = await fetchAlert(selectedAlertIdRef.current);
                         setSelectedAlert(fullAlert);
+                        setModalDecisionsRefreshToken((current) => current + 1);
                     } catch (err) {
                         console.error("Failed to refresh alert details", err);
                         // Keep showing current data on error
                     }
                 }
-            }
-
-            // Check for generic search query param
-            if (queryParam) {
-                setFilter(queryParam);
             }
 
             setLastUpdated(new Date());
@@ -234,36 +309,216 @@ export function Alerts() {
                 lastCompletedLoadRef.current = { key: loadKey, completedAt: Date.now() };
             }
             if (append) setLoadingMore(false);
-            if (!isBackground) setLoading(false);
+            if (shouldBlockWithInitialLoading) {
+                setInitialLoading(false);
+            } else {
+                setBackgroundLoading(false);
+            }
         }
-    }, [alertIdParam, buildServerFilters, filter, queryParam, searchParams, setLastUpdated]);
+    }, [alertIdParam, appliedQuery, buildServerFilters, loadConfig, searchParams, setLastUpdated]);
+
+    useEffect(() => {
+        loadAlertsRef.current = loadAlerts;
+    }, [loadAlerts]);
 
     const lastAlertElementRef = useCallback((node: HTMLTableRowElement | null) => {
-        if (loading || loadingMore || !hasMoreAlerts) return;
+        if (initialLoading || backgroundLoading || loadingMore || !hasMoreAlerts) return;
         if (observer.current) observer.current.disconnect();
         observer.current = new IntersectionObserver((entries) => {
             if (entries[0].isIntersecting) {
-                void loadAlerts(true, currentPage + 1, true);
+                void loadAlerts({ isBackground: true, page: currentPage + 1, append: true });
             }
         });
         if (node) observer.current.observe(node);
-    }, [currentPage, hasMoreAlerts, loadAlerts, loading, loadingMore]);
+    }, [backgroundLoading, currentPage, hasMoreAlerts, initialLoading, loadAlerts, loadingMore]);
 
     useEffect(() => {
-        loadAlerts(false);
+        void loadAlerts({ refreshConfig: true });
     }, [loadAlerts]);
 
 
     useEffect(() => {
-        if (refreshSignal > 0) loadAlerts(true, 1, false, true);
-    }, [refreshSignal, loadAlerts]);
+        if (refreshSignal <= lastRefreshSignalRef.current) {
+            return;
+        }
+
+        lastRefreshSignalRef.current = refreshSignal;
+        void loadAlertsRef.current({ isBackground: true, page: 1, preserveLoadedPages: true, refreshConfig: true });
+    }, [refreshSignal]);
+
+    useEffect(() => {
+        const nextQuery = queryParam ?? "";
+        setSearchDraft((current) => current === nextQuery ? current : nextQuery);
+        setDebouncedSearchDraft((current) => current === nextQuery ? current : nextQuery);
+    }, [queryParam]);
+
+    useEffect(() => {
+        if (searchDraft === debouncedSearchDraft) {
+            return;
+        }
+
+        const timeoutId = window.setTimeout(() => {
+            setDebouncedSearchDraft(searchDraft);
+        }, 300);
+
+        return () => window.clearTimeout(timeoutId);
+    }, [debouncedSearchDraft, searchDraft]);
+
+    useEffect(() => {
+        const compiledSearch = compileAlertSearch(debouncedSearchDraft, searchValidationFeatures);
+        if (!compiledSearch.ok) {
+            setQueryError((current) => (
+                current?.message === compiledSearch.error.message &&
+                current.position === compiledSearch.error.position &&
+                current.length === compiledSearch.error.length
+                    ? current
+                    : compiledSearch.error
+            ));
+            return;
+        }
+
+        const nextQuery = debouncedSearchDraft.trim();
+        setQueryError(null);
+        setAppliedQuery((current) => current === nextQuery ? current : nextQuery);
+
+        if (queryParam === nextQuery) {
+            return;
+        }
+
+        const nextParams = new URLSearchParams(searchParams);
+        if (nextQuery) {
+            nextParams.set("q", nextQuery);
+        } else {
+            nextParams.delete("q");
+        }
+        if (nextParams.toString() !== searchParams.toString()) {
+            setSearchParams(nextParams);
+        }
+    }, [debouncedSearchDraft, queryParam, searchParams, searchValidationFeatures, setSearchParams]);
 
     // Keep ref in sync with selectedAlert for auto-refresh
     useEffect(() => {
+        const nextSelectedAlertId = selectedAlert ? String(selectedAlert.id) : null;
         selectedAlertIdRef.current = selectedAlert?.id || null;
-        setShowAllEvents(false);
-        setDisplayedDecisionCount(50);
+        if (previousSelectedAlertIdRef.current !== nextSelectedAlertId) {
+            setShowAllEvents(false);
+        }
+        previousSelectedAlertIdRef.current = nextSelectedAlertId;
     }, [selectedAlert]);
+
+    const selectedAlertId = selectedAlert ? String(selectedAlert.id) : null;
+    const hasMoreModalDecisions = modalDecisionsPage < modalDecisionsTotalPages;
+
+    const loadModalDecisions = useCallback(async (
+        alertId: string,
+        page = 1,
+        {
+            append = false,
+            preserveLoadedPages = false,
+            forceRefresh = false,
+        }: {
+            append?: boolean;
+            preserveLoadedPages?: boolean;
+            forceRefresh?: boolean;
+        } = {},
+    ) => {
+        const previousLoad = modalDecisionsLoadRef.current;
+        if (!forceRefresh && previousLoad.alertId === alertId && previousLoad.page === page) {
+            return;
+        }
+
+        modalDecisionsLoadRef.current = { alertId, page };
+
+        if (append) {
+            setModalDecisionsLoadingMore(true);
+        } else {
+            setModalDecisionsLoading(true);
+        }
+
+        try {
+            const result = await fetchDecisionsPaginated(page, PAGE_SIZE, {
+                alert_id: alertId,
+                include_expired: "true",
+                tz_offset: String(new Date().getTimezoneOffset()),
+            });
+
+            let decisionsData = result.data;
+            let nextPage = result.pagination.page;
+
+            if (!append && preserveLoadedPages) {
+                const loadedPageCount = Math.max(1, modalDecisionsPage);
+                const maxPageToRefresh = Math.max(1, Math.min(loadedPageCount, result.pagination.total_pages || 1));
+                if (maxPageToRefresh > 1) {
+                    const remainingPages = await Promise.all(
+                        Array.from({ length: maxPageToRefresh - 1 }, (_, index) => (
+                            fetchDecisionsPaginated(index + 2, PAGE_SIZE, {
+                                alert_id: alertId,
+                                include_expired: "true",
+                                tz_offset: String(new Date().getTimezoneOffset()),
+                            })
+                        )),
+                    );
+                    decisionsData = [result, ...remainingPages].flatMap((pageResult) => pageResult.data);
+                }
+                nextPage = maxPageToRefresh;
+            }
+
+            setModalDecisions((current) => append ? [...current, ...result.data] : decisionsData);
+            setModalDecisionsPage(nextPage);
+            setModalDecisionsTotalPages(result.pagination.total_pages);
+            setModalDecisionsTotal(result.pagination.total);
+        } catch (error) {
+            console.error("Failed to load alert decisions", error);
+        } finally {
+            if (append) {
+                setModalDecisionsLoadingMore(false);
+            } else {
+                setModalDecisionsLoading(false);
+            }
+        }
+    }, [modalDecisionsPage]);
+
+    useEffect(() => {
+        if (!selectedAlertId) {
+            modalDecisionsLoadRef.current = { alertId: null, page: null };
+            setModalDecisions([]);
+            setModalDecisionsPage(1);
+            setModalDecisionsTotalPages(1);
+            setModalDecisionsTotal(0);
+            modalSelectedAlertIdRef.current = null;
+            return;
+        }
+
+        const selectedAlertChanged = modalSelectedAlertIdRef.current !== selectedAlertId;
+        modalSelectedAlertIdRef.current = selectedAlertId;
+        if (selectedAlertChanged) {
+            modalDecisionsLoadRef.current = { alertId: null, page: null };
+            setModalDecisions([]);
+            setModalDecisionsPage(1);
+            setModalDecisionsTotalPages(1);
+            setModalDecisionsTotal(0);
+            void loadModalDecisions(selectedAlertId, 1, { forceRefresh: true });
+            return;
+        }
+
+        void loadModalDecisions(selectedAlertId, 1, {
+            preserveLoadedPages: true,
+            forceRefresh: true,
+        });
+    }, [loadModalDecisions, modalDecisionsRefreshToken, selectedAlertId]);
+
+    const lastModalDecisionElementRef = useCallback((node: HTMLTableRowElement | null) => {
+        if (!selectedAlertId || modalDecisionsLoading || modalDecisionsLoadingMore || !hasMoreModalDecisions) return;
+        if (modalDecisionObserverRef.current) modalDecisionObserverRef.current.disconnect();
+        modalDecisionObserverRef.current = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting) {
+                void loadModalDecisions(selectedAlertId, modalDecisionsPage + 1, { append: true });
+            }
+        }, {
+            root: decisionContainerRef.current,
+        });
+        if (node) modalDecisionObserverRef.current.observe(node);
+    }, [hasMoreModalDecisions, loadModalDecisions, modalDecisionsLoading, modalDecisionsLoadingMore, modalDecisionsPage, selectedAlertId]);
 
     // Handler to fetch full alert data when clicking on a row
     // Since list view now returns slim alerts, we need to fetch full data for the modal
@@ -280,6 +535,42 @@ export function Alerts() {
             // Keep showing slim data as fallback
         }
     };
+
+    const applySearchExample = useCallback((query: string) => {
+        setSearchDraft(query);
+        setDebouncedSearchDraft(query);
+        setAppliedQuery(query.trim());
+        setQueryError(null);
+        setShowSearchSyntaxModal(false);
+        window.setTimeout(() => {
+            searchInputRef.current?.focus();
+        }, 0);
+    }, []);
+
+    const insertSearchSnippet = useCallback((snippet: string) => {
+        const input = searchInputRef.current;
+        const currentValue = input?.value ?? searchDraft;
+        const selectionStart = input?.selectionStart ?? currentValue.length;
+        const selectionEnd = input?.selectionEnd ?? currentValue.length;
+        const nextQuery = `${currentValue.slice(0, selectionStart)}${snippet}${currentValue.slice(selectionEnd)}`;
+        const nextCaretPosition = selectionStart + snippet.length;
+
+        setSearchDraft(nextQuery);
+        setQueryError(null);
+
+        window.setTimeout(() => {
+            searchInputRef.current?.focus();
+            searchInputRef.current?.setSelectionRange(nextCaretPosition, nextCaretPosition);
+        }, 0);
+    }, [searchDraft]);
+
+    const clearAllFilters = useCallback(() => {
+        setSearchDraft("");
+        setDebouncedSearchDraft("");
+        setAppliedQuery("");
+        setQueryError(null);
+        setSearchParams({});
+    }, [setSearchParams]);
 
     // Delete handlers
     const requestDelete = (id: string | number, event: ReactMouseEvent<HTMLButtonElement>) => {
@@ -320,7 +611,7 @@ export function Alerts() {
             }
 
             setPendingDeleteAction(null);
-            await loadAlerts(false, 1, false);
+            await loadAlerts({ page: 1, refreshConfig: true });
             if (resultMessage) {
                 setErrorInfo({ message: resultMessage });
             }
@@ -373,8 +664,6 @@ export function Alerts() {
     };
 
     const visibleAlerts = filteredAlerts;
-    const selectedAlertDecisions = selectedAlert?.decisions ?? [];
-    const visibleSelectedAlertDecisions = selectedAlertDecisions.slice(0, displayedDecisionCount);
     const selectedAlertEvents = selectedAlert && hasAlertEvents(selectedAlert) ? selectedAlert.events ?? [] : [];
     const selectedAlertIsSimulated = selectedAlert ? isSimulatedAlert(selectedAlert) : false;
     const selectedAlertSourceValue = getAlertSourceValue(selectedAlert?.source);
@@ -388,16 +677,28 @@ export function Alerts() {
     const selectedAlertCount = selectedFilteredAlertIds.length;
     const pendingSingleAlertId = pendingDeleteAction?.kind === "single" ? pendingDeleteAction.alertId : null;
     const pendingIp = pendingDeleteAction?.kind === "ip" ? pendingDeleteAction.ip : null;
+    const summaryText = initialLoading && !hasLoadedAlertsRef.current
+        ? "Loading alerts..."
+        : totalAlerts !== totalUnfilteredAlerts
+            ? `Showing ${visibleAlerts.length} of ${totalAlerts} alerts (${totalUnfilteredAlerts} total before filters)`
+            : `Showing ${visibleAlerts.length} of ${totalAlerts} alerts`;
+    const tableBusy = initialLoading || backgroundLoading || loadingMore;
 
     return (
         <div className="space-y-6">
-            {(totalAlerts !== totalUnfilteredAlerts || visibleAlerts.length < totalAlerts) && (
-                <div className="text-sm text-gray-500">
-                    {totalAlerts !== totalUnfilteredAlerts
-                        ? `Showing ${visibleAlerts.length} of ${totalAlerts} alerts (${totalUnfilteredAlerts} total before filters)`
-                        : `Showing ${visibleAlerts.length} of ${totalAlerts} alerts`}
-                </div>
-            )}
+            <div
+                data-testid="alerts-summary"
+                className="flex min-h-[1.5rem] items-center justify-between gap-3 text-sm text-gray-500"
+            >
+                <span>{summaryText}</span>
+                <span
+                    className={`inline-flex items-center gap-2 text-xs transition-opacity ${backgroundLoading ? 'opacity-100' : 'opacity-0'}`}
+                    aria-live="polite"
+                >
+                    <span className="h-2 w-2 rounded-full bg-primary-500 animate-pulse" aria-hidden="true" />
+                    Refreshing...
+                </span>
+            </div>
 
             <div className="flex items-center gap-3">
                 <button
@@ -441,8 +742,28 @@ export function Alerts() {
             )}
 
             {/* Show active filters */}
-            {(searchParams.get("ip") || searchParams.get("country") || searchParams.get("scenario") || searchParams.get("as") || searchParams.get("target") || searchParams.get("date") || searchParams.get("dateStart") || searchParams.get("dateEnd") || (simulationsEnabled && searchParams.get("simulation"))) && (
+            {(appliedQuery || searchParams.get("ip") || searchParams.get("country") || searchParams.get("scenario") || searchParams.get("as") || searchParams.get("target") || searchParams.get("date") || searchParams.get("dateStart") || searchParams.get("dateEnd") || (simulationsEnabled && searchParams.get("simulation"))) && (
                 <div className="flex flex-wrap gap-2">
+                    {appliedQuery && (
+                        <Badge variant="secondary" className="flex items-center gap-1 max-w-full">
+                            <span className="font-semibold">Search:</span>
+                            <span className="font-mono text-xs truncate max-w-[320px]">{appliedQuery}</span>
+                            <button
+                                onClick={() => {
+                                    const nextParams = new URLSearchParams(searchParams);
+                                    nextParams.delete("q");
+                                    setSearchDraft("");
+                                    setDebouncedSearchDraft("");
+                                    setAppliedQuery("");
+                                    setQueryError(null);
+                                    setSearchParams(nextParams);
+                                }}
+                                className="ml-1 hover:text-red-500"
+                            >
+                                &times;
+                            </button>
+                        </Badge>
+                    )}
                     {[
                         "ip",
                         "country",
@@ -473,7 +794,7 @@ export function Alerts() {
                         );
                     })}
                     <button
-                        onClick={() => setSearchParams({})}
+                        onClick={clearAllFilters}
                         className="text-xs text-gray-500 hover:text-gray-900 dark:hover:text-gray-300 underline"
                     >
                         Reset all filters
@@ -482,20 +803,44 @@ export function Alerts() {
             )
             }
 
-            <div className="relative">
-                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Search className="h-5 w-5 text-gray-400" />
+            <div className="space-y-2">
+                <div className="flex items-stretch gap-2">
+                    <div className="relative flex-1">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <Search className="h-5 w-5 text-gray-400" />
+                        </div>
+                        <input
+                            ref={searchInputRef}
+                            type="text"
+                            placeholder="Filter alerts..."
+                            className={`block w-full pl-10 pr-3 py-2 border rounded-md leading-5 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 sm:text-sm ${queryError ? 'border-red-300 dark:border-red-700 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 dark:border-gray-700 focus:ring-primary-500 focus:border-primary-500'}`}
+                            value={searchDraft}
+                            onChange={(e) => setSearchDraft(e.target.value)}
+                            aria-invalid={queryError ? 'true' : 'false'}
+                            aria-describedby={queryError ? 'alerts-search-error' : undefined}
+                        />
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => setShowSearchSyntaxModal(true)}
+                        className="inline-flex items-center justify-center rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 text-gray-600 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-gray-700"
+                        aria-label="Search syntax help"
+                        title="Search syntax help"
+                    >
+                        <Info size={18} />
+                    </button>
                 </div>
-                <input
-                    type="text"
-                    placeholder="Filter alerts..."
-                    className="block w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-gray-700 rounded-md leading-5 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 sm:text-sm"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                />
+                {queryError && (
+                    <p id="alerts-search-error" className="text-xs text-red-600 dark:text-red-400">
+                        Search syntax error at character {queryError.position + 1}: {queryError.message}
+                    </p>
+                )}
             </div>
 
-            <div className="bg-white dark:bg-gray-800 shadow-sm rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+            <div
+                className="bg-white dark:bg-gray-800 shadow-sm rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700"
+                aria-busy={tableBusy}
+            >
                 <div className="overflow-x-auto">
                     <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 transition-opacity duration-200">
                         <thead className="bg-gray-50 dark:bg-gray-900/50">
@@ -512,26 +857,32 @@ export function Alerts() {
                                     />
                                 </th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Time</th>
-                                {machineFeaturesEnabled && (
-                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Machine</th>
-                                )}
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Scenario</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Country</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">AS</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">IP / Range</th>
+                                {machineFeaturesEnabled && (
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Machine</th>
+                                )}
+                                {originFeaturesEnabled && (
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Origin</th>
+                                )}
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Decisions</th>
                                 <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Actions</th>
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {loading ? (
-                                <tr><td colSpan={machineFeaturesEnabled ? 9 : 8} className="px-6 py-4 text-center text-sm text-gray-500">Loading alerts...</td></tr>
+                            {initialLoading && visibleAlerts.length === 0 ? (
+                                <tr><td colSpan={8 + (machineFeaturesEnabled ? 1 : 0) + (originFeaturesEnabled ? 1 : 0)} className="px-6 py-4 text-center text-sm text-gray-500">Loading alerts...</td></tr>
                             ) : visibleAlerts.length === 0 ? (
-                                <tr><td colSpan={machineFeaturesEnabled ? 9 : 8} className="px-6 py-4 text-center text-sm text-gray-500">No alerts found</td></tr>
+                                <tr><td colSpan={8 + (machineFeaturesEnabled ? 1 : 0) + (originFeaturesEnabled ? 1 : 0)} className="px-6 py-4 text-center text-sm text-gray-500">No alerts found</td></tr>
                             ) : (
                                 visibleAlerts.map((alert, index) => {
                                     const isLastElement = index === visibleAlerts.length - 1;
                                     const sourceValue = getAlertSourceValue(alert.source);
+                                    const alertOrigins = collectDistinctOrigins(alert.decisions);
+                                    const alertOriginDisplay = getOriginDisplayValue(alertOrigins);
+                                    const alertOriginTitle = getOriginTitle(alertOrigins);
                                     const isSelected = selectedAlertIds.includes(String(alert.id));
                                     return (
                                         <tr
@@ -552,11 +903,6 @@ export function Alerts() {
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
                                                 <TimeDisplay timestamp={alert.created_at} />
                                             </td>
-                                            {machineFeaturesEnabled && (
-                                                <td className="px-6 py-4 text-sm text-gray-500 dark:text-gray-400 max-w-[120px] truncate" title={resolveMachineName(alert)}>
-                                                    {resolveMachineName(alert) || "-"}
-                                                </td>
-                                            )}
                                             <td className="px-6 py-4 text-sm text-gray-900 dark:text-gray-100 max-w-[200px]" title={alert.scenario}>
                                                 <ScenarioName
                                                     name={alert.scenario}
@@ -581,6 +927,16 @@ export function Alerts() {
                                             <td className="px-6 py-4 text-sm font-mono text-gray-900 dark:text-gray-100 max-w-[200px] truncate" title={sourceValue}>
                                                 {sourceValue || "-"}
                                             </td>
+                                            {machineFeaturesEnabled && (
+                                                <td className="px-6 py-4 text-sm text-gray-500 dark:text-gray-400 max-w-[120px] truncate" title={resolveMachineName(alert)}>
+                                                    {resolveMachineName(alert) || "-"}
+                                                </td>
+                                            )}
+                                            {originFeaturesEnabled && (
+                                                <td className="px-6 py-4 text-sm text-gray-500 dark:text-gray-400 max-w-[140px] truncate" title={alertOriginTitle}>
+                                                    {alertOriginDisplay}
+                                                </td>
+                                            )}
                                             <td className="px-6 py-4 whitespace-nowrap text-sm" onClick={(e) => e.stopPropagation()}>
                                                 {(() => {
                                                     const visibleDecisions = simulationsEnabled && currentSimulationFilter !== 'all'
@@ -778,13 +1134,13 @@ export function Alerts() {
                         )}
 
                         {/* Decisions */}
-                        {selectedAlertDecisions.length > 0 && (
+                        {(modalDecisionsLoading || modalDecisionsTotal > 0) && (
                             <div>
                                 <div className="flex items-center justify-between gap-3 mb-3">
                                     <h4 className="text-lg font-semibold text-gray-900 dark:text-white">Decisions Taken</h4>
-                                    {selectedAlertDecisions.length > visibleSelectedAlertDecisions.length && (
+                                    {(modalDecisionsLoading || modalDecisions.length < modalDecisionsTotal) && (
                                         <span className="text-xs text-gray-500 dark:text-gray-400">
-                                            Showing {visibleSelectedAlertDecisions.length} of {selectedAlertDecisions.length}
+                                            Showing {modalDecisions.length} of {modalDecisionsTotal}
                                         </span>
                                     )}
                                 </div>
@@ -804,32 +1160,41 @@ export function Alerts() {
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-gray-200 dark:divide-gray-700 bg-white dark:bg-gray-800">
-                                            {visibleSelectedAlertDecisions.map((decision, idx) => {
+                                            {modalDecisionsLoading && modalDecisions.length === 0 ? (
+                                                <tr>
+                                                    <td colSpan={6} className="px-4 py-4 text-sm text-center text-gray-500">
+                                                        Loading decisions...
+                                                    </td>
+                                                </tr>
+                                            ) : modalDecisions.map((decision, idx) => {
                                                 // Check if this specific decision is active or expired
                                                 const isActive = (() => {
                                                     if (decision.expired !== undefined) {
                                                         return !decision.expired;
                                                     }
 
-                                                    if (decision.stop_at) {
-                                                        return new Date(decision.stop_at) > new Date();
+                                                    if (decision.detail.expiration) {
+                                                        return new Date(decision.detail.expiration) > new Date();
                                                     }
                                                     // If stop_at is missing, check if duration implies expiration
-                                                    if (decision.duration && decision.duration.startsWith('-')) {
+                                                    if (decision.detail.duration && decision.detail.duration.startsWith('-')) {
                                                         return false;
                                                     }
                                                     return true; // Assume active if no stop_at and not definitely expired
                                                 })();
                                                 return (
-                                                    <tr key={`${decision.id}-${decision.duration ?? idx}`}>
+                                                    <tr
+                                                        key={`${decision.id}-${decision.detail.duration ?? idx}`}
+                                                        ref={idx === modalDecisions.length - 1 ? lastModalDecisionElementRef : null}
+                                                    >
                                                         <td className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">#{decision.id}</td>
-                                                        <td className="px-4 py-2 text-sm"><Badge variant="danger">{decision.type}</Badge></td>
+                                                        <td className="px-4 py-2 text-sm"><Badge variant="danger">{decision.detail.type || decision.detail.action || "ban"}</Badge></td>
                                                         <td className="px-4 py-2 text-sm font-mono">{decision.value}</td>
                                                         <td className="px-4 py-2 text-sm">
-                                                            {decision.duration && decision.duration.startsWith('-') ? "0s" : decision.duration}
+                                                            {(decision.detail.duration || "").startsWith('-') ? "0s" : decision.detail.duration}
                                                             {!isActive && <span className="ml-2 text-xs text-red-500 dark:text-red-400">(Expired)</span>}
                                                         </td>
-                                                        <td className="px-4 py-2 text-sm">{decision.origin}</td>
+                                                        <td className="px-4 py-2 text-sm">{decision.detail.origin || "-"}</td>
                                                         <td className="px-4 py-2 text-sm">
                                                             {isActive ? (
                                                                 <Link
@@ -864,17 +1229,16 @@ export function Alerts() {
                                                     </tr>
                                                 );
                                             })}
+                                            {modalDecisionsLoadingMore && (
+                                                <tr>
+                                                    <td colSpan={6} className="px-4 py-4 text-sm text-center text-gray-500">
+                                                        Loading more decisions...
+                                                    </td>
+                                                </tr>
+                                            )}
                                         </tbody>
                                     </table>
                                 </div>
-                                {selectedAlertDecisions.length > visibleSelectedAlertDecisions.length && (
-                                    <button
-                                        onClick={() => setDisplayedDecisionCount((prev) => Math.min(prev + 50, selectedAlertDecisions.length))}
-                                        className="mt-3 w-full py-2 text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 bg-gray-50 dark:bg-gray-900/30 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors cursor-pointer"
-                                    >
-                                        Load 50 more decisions ({selectedAlertDecisions.length - visibleSelectedAlertDecisions.length} remaining)
-                                    </button>
-                                )}
                             </div>
                         )}
 
@@ -947,6 +1311,13 @@ export function Alerts() {
                     </button>
                 </div>
             </Modal>
+            <SearchSyntaxModal
+                help={searchHelp}
+                isOpen={showSearchSyntaxModal}
+                onClose={() => setShowSearchSyntaxModal(false)}
+                onSelectExample={applySearchExample}
+                onInsertSnippet={insertSearchSnippet}
+            />
         </div >
     );
 }

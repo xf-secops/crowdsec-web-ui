@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
@@ -15,10 +16,11 @@ const {
   fetchConfigMock: vi.fn(),
   fetchDashboardStatsMock: vi.fn(),
 }));
+let refreshSignalMock = 0;
 
 vi.mock('../contexts/useRefresh', () => ({
   useRefresh: () => ({
-    refreshSignal: 0,
+    refreshSignal: refreshSignalMock,
     setLastUpdated: vi.fn(),
   }),
 }));
@@ -95,6 +97,7 @@ function buildDashboardStatsResponse(filters?: Record<string, string>) {
 }
 
 beforeEach(() => {
+  refreshSignalMock = 0;
   vi.stubGlobal(
     'matchMedia',
     vi.fn().mockImplementation(() => ({
@@ -117,13 +120,27 @@ beforeEach(() => {
     sync_status: { isSyncing: false, progress: 100, message: 'done', startedAt: null, completedAt: null },
     simulations_enabled: true,
     machine_features_enabled: false,
+    origin_features_enabled: false,
   });
   fetchDashboardStatsMock.mockImplementation(async (filters?: Record<string, string>) => buildDashboardStatsResponse(filters));
 });
 
 afterEach(() => {
+  refreshSignalMock = 0;
   vi.restoreAllMocks();
 });
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve, reject };
+}
 
 describe('Dashboard page', () => {
   test('shows simulation counts separately and passes simulation series to chart and map when enabled', async () => {
@@ -207,6 +224,7 @@ describe('Dashboard page', () => {
       sync_status: { isSyncing: false, progress: 100, message: 'done', startedAt: null, completedAt: null },
       simulations_enabled: false,
       machine_features_enabled: false,
+      origin_features_enabled: false,
     });
 
     render(
@@ -256,5 +274,126 @@ describe('Dashboard page', () => {
       scaleMode?: 'linear' | 'symlog';
     };
     expect(defaultScaleProps.scaleMode).toBe('linear');
+  });
+
+  test('keeps dashboard cards and visualizations mounted while filter refresh is in flight', async () => {
+    const deferred = createDeferred<ReturnType<typeof buildDashboardStatsResponse>>();
+    fetchDashboardStatsMock.mockImplementation((filters?: Record<string, string>) => {
+      if (filters?.simulation === 'live') {
+        return deferred.promise;
+      }
+
+      return Promise.resolve(buildDashboardStatsResponse(filters));
+    });
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Total Alerts')).toBeInTheDocument());
+    expect(screen.getByText('Chart')).toBeInTheDocument();
+    expect(screen.getByText('Map')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+
+    expect(screen.getByText('Chart')).toBeInTheDocument();
+    expect(screen.getByText('Map')).toBeInTheDocument();
+    expect(screen.queryByText('Loading statistics...')).not.toBeInTheDocument();
+    expect(screen.getByText('Refreshing dashboard...')).toBeInTheDocument();
+
+    deferred.resolve(buildDashboardStatsResponse({ simulation: 'live' }));
+
+    await waitFor(() => {
+      const alertsCard = screen.getByText('Total Alerts').closest('a');
+      expect(alertsCard).not.toBeNull();
+      expect(within(alertsCard as HTMLElement).getByRole('heading', { level: 3 })).toHaveTextContent('1');
+    });
+  });
+
+  test('retries the initial dashboard load after a strict mode abort cleanup', async () => {
+    const pendingRequests: Array<{ resolve: (value: ReturnType<typeof buildDashboardStatsResponse>) => void }> = [];
+    fetchDashboardStatsMock.mockImplementation((_filters?: Record<string, string>, init?: RequestInit) => (
+      new Promise((resolve, reject) => {
+        const signal = init?.signal;
+        if (signal) {
+          if (signal.aborted) {
+            reject(new Error('aborted'));
+            return;
+          }
+          signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }
+
+        pendingRequests.push({
+          resolve: (value) => resolve(value),
+        });
+      })
+    ));
+
+    render(
+      <StrictMode>
+        <MemoryRouter>
+          <Dashboard />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(fetchDashboardStatsMock).toHaveBeenCalledTimes(2));
+
+    const latestRequest = pendingRequests.at(-1);
+    expect(latestRequest).toBeDefined();
+    latestRequest?.resolve(buildDashboardStatsResponse());
+
+    await waitFor(() => expect(screen.getByText('Total Alerts')).toBeInTheDocument());
+  });
+
+  test('does not trigger a duplicate dashboard load when filters change after a refresh signal', async () => {
+    refreshSignalMock = 1;
+    const completedLiveLoads: Array<Record<string, string> | undefined> = [];
+    fetchDashboardStatsMock.mockImplementation((filters?: Record<string, string>, init?: RequestInit) => (
+      new Promise((resolve, reject) => {
+        const signal = init?.signal;
+        const finishRequest = () => {
+          if (signal?.aborted) {
+            reject(new Error('aborted'));
+            return;
+          }
+
+          completedLiveLoads.push(filters);
+          resolve(buildDashboardStatsResponse(filters));
+        };
+
+        if (signal) {
+          if (signal.aborted) {
+            reject(new Error('aborted'));
+            return;
+          }
+          signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }
+
+        queueMicrotask(finishRequest);
+      })
+    ));
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Total Alerts')).toBeInTheDocument());
+    fetchDashboardStatsMock.mockClear();
+    completedLiveLoads.length = 0;
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+
+    await waitFor(() => {
+      const alertsCard = screen.getByText('Total Alerts').closest('a');
+      expect(alertsCard).not.toBeNull();
+      expect(within(alertsCard as HTMLElement).getByRole('heading', { level: 3 })).toHaveTextContent('1');
+    });
+
+    expect(completedLiveLoads).toHaveLength(1);
+    expect(completedLiveLoads[0]).toMatchObject({ simulation: 'live' });
   });
 });
