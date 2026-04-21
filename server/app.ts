@@ -100,6 +100,20 @@ interface AlertSyncQuery {
   singleScopeOnly?: boolean;
 }
 
+interface SyncHistorySummary {
+  historicalAlerts: number;
+  historicalDecisions: number;
+  activeDecisionAlerts: number;
+  activeDecisions: number;
+  activeNetCachedAlerts: number;
+  activeNetCachedDecisions: number;
+  activePrunedAlerts: number;
+  activePrunedDecisions: number;
+  activeError: string | null;
+  cachedAlerts: number;
+  cachedDecisions: number;
+}
+
 interface CachedDecisionRecord {
   id: string;
   value?: string;
@@ -231,6 +245,14 @@ function getAlertFallbackOrigins(alert: Pick<AlertRecord, 'decisions' | 'source'
   }
 
   return [];
+}
+
+function countAlertDecisions(alerts: AlertRecord[]): number {
+  return alerts.reduce((total, alert) => total + (Array.isArray(alert.decisions) ? alert.decisions.length : 0), 0);
+}
+
+function formatSignedCount(count: number): string {
+  return count > 0 ? `+${count}` : String(count);
 }
 
 export function createApp(options: CreateAppOptions = {}): AppController {
@@ -448,7 +470,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     const doRequest = async () => {
-      const result = await lapiClient.deleteAlert(alertId);
+      const result = await deleteAlertFromLapi(alertId);
       database.deleteAlert(alertId);
       database.deleteDecisionsByAlertId(alertId);
       dashboardStatsCache = null;
@@ -899,7 +921,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     const doRequest = async () => {
-      const result = await lapiClient.deleteDecision(decisionId);
+      const result = await deleteDecisionFromLapi(decisionId);
       console.log(`Removing decision ${decisionId} from local cache...`);
       database.deleteDecision(decisionId);
       dashboardStatsCache = null;
@@ -1100,6 +1122,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     since: string | null = null,
     until: string | null = null,
     hasActiveDecision = false,
+    options: { requireComplete?: boolean } = {},
   ): Promise<AlertRecord[]> {
     const configuredQueries = getAlertSyncQueries();
     if (configuredQueries.length === 0 && config.alertFilterMode === 'new' && hasExplicitNewAlertIncludes()) {
@@ -1107,7 +1130,12 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     const queries = configuredQueries.length === 0 ? [{ includeCapi: false }] : configuredQueries;
-    const resultSets = await Promise.all(queries.map((query) => lapiClient.fetchAlerts(since, until, hasActiveDecision, query)));
+    const resultSets = await Promise.all(queries.map((query) =>
+      lapiClient.fetchAlerts(since, until, hasActiveDecision, {
+        ...query,
+        requireAllScopes: options.requireComplete,
+      }),
+    ));
 
     const merged = new Map<string, AlertRecord>();
     for (const resultSet of resultSets) {
@@ -1210,7 +1238,42 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     database.deleteDecisionsByAlertIdExcept(alert.id, currentDecisionIds);
   }
 
-  async function syncHistory(): Promise<number> {
+  function reconcileSyncedAlertWindow(alerts: AlertRecord[], start: string, end: string): { alerts: number; decisions: number } {
+    let pruned = { alerts: 0, decisions: 0 };
+    const keepIds = alerts.map((alert) => alert.id);
+    const reconcileTransaction = database.transaction<AlertRecord[]>((items) => {
+      for (const alert of items) {
+        processAlertForDatabase(alert);
+      }
+      pruned = database.deleteAlertsMissingBetween(start, end, keepIds);
+    });
+
+    reconcileTransaction(alerts);
+    if (pruned.alerts > 0 || pruned.decisions > 0) {
+      dashboardStatsCache = null;
+    }
+    return pruned;
+  }
+
+  function reconcileActiveDecisionAlerts(alerts: AlertRecord[], now: string): { alerts: number; decisions: number } {
+    let pruned = { alerts: 0, decisions: 0 };
+    const keepIds = alerts.map((alert) => alert.id);
+    const since = new Date(Date.now() - config.lookbackMs).toISOString();
+    const reconcileTransaction = database.transaction<AlertRecord[]>((items) => {
+      for (const alert of items) {
+        processAlertForDatabase(alert);
+      }
+      pruned = database.deleteActiveAlertsMissing(keepIds, now, since);
+    });
+
+    reconcileTransaction(alerts);
+    if (pruned.alerts > 0 || pruned.decisions > 0) {
+      dashboardStatsCache = null;
+    }
+    return pruned;
+  }
+
+  async function syncHistory(): Promise<SyncHistorySummary> {
     const showOverlay = isFirstSync;
     isFirstSync = false;
     console.log('Starting historical data sync...');
@@ -1229,31 +1292,43 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     const totalDuration = now - lookbackStart;
     let currentStart = lookbackStart;
     let totalAlerts = 0;
+    let totalDecisions = 0;
+    let activeDecisionAlertsCount = 0;
+    let activeDecisionsCount = 0;
+    let activeNetCachedAlerts = 0;
+    let activeNetCachedDecisions = 0;
+    let activePrunedAlerts = 0;
+    let activePrunedDecisions = 0;
+    let activeError: string | null = null;
 
     while (currentStart < now) {
       const currentEnd = Math.min(currentStart + chunkSizeMs, now);
       const progress = Math.round(((currentEnd - lookbackStart) / totalDuration) * 100);
       const sinceDuration = toDuration(currentStart);
       const untilDuration = toDuration(currentEnd);
-      const progressMessage = `Syncing: ${sinceDuration} -> ${untilDuration} ago (${totalAlerts} alerts)`;
+      const progressMessage = `Syncing: ${sinceDuration} -> ${untilDuration} ago (${totalAlerts} alerts, ${totalDecisions} decisions)`;
 
       updateSyncStatus({
         progress: Math.min(progress, 90),
-        message: `Syncing: ${sinceDuration} -> ${untilDuration} ago (${totalAlerts} alerts)`,
+        message: progressMessage,
       });
       console.log(progressMessage);
 
       try {
-        const alerts = await fetchAlertsForSync(sinceDuration, untilDuration);
+        const alerts = await fetchAlertsForSync(sinceDuration, untilDuration, false, { requireComplete: true });
+        const decisionCount = countAlertDecisions(alerts);
+        const pruned = reconcileSyncedAlertWindow(
+          alerts,
+          new Date(currentStart).toISOString(),
+          new Date(currentEnd).toISOString(),
+        );
         if (alerts.length > 0) {
-          const insertTransaction = database.transaction<AlertRecord[]>((items) => {
-            for (const alert of items) {
-              processAlertForDatabase(alert);
-            }
-          });
-          insertTransaction(alerts);
           totalAlerts += alerts.length;
-          console.log(`  -> Imported ${alerts.length} alerts.`);
+          totalDecisions += decisionCount;
+          console.log(`  -> Imported ${alerts.length} alerts and ${decisionCount} decisions.`);
+        }
+        if (pruned.alerts > 0 || pruned.decisions > 0) {
+          console.log(`  -> Pruned ${pruned.alerts} stale alerts and ${pruned.decisions} stale decisions.`);
         }
       } catch (error: any) {
         console.error('Failed to sync chunk:', error.message);
@@ -1265,29 +1340,44 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
     updateSyncStatus({ progress: 95, message: 'Syncing active decisions...' });
     try {
-      const activeDecisionAlerts = await fetchAlertsForSync(null, null, true);
-      if (activeDecisionAlerts.length > 0) {
-        const refreshTransaction = database.transaction<AlertRecord[]>((alerts) => {
-          for (const alert of alerts) {
-            processAlertForDatabase(alert);
-          }
-        });
-        refreshTransaction(activeDecisionAlerts);
-        console.log(`  -> Synced ${activeDecisionAlerts.length} alerts with active decisions.`);
-      }
+      const activeDecisionAlerts = await fetchAlertsForSync(null, null, true, { requireComplete: true });
+      const activeDecisionCount = countAlertDecisions(activeDecisionAlerts);
+      const cachedAlertsBeforeActiveSync = database.countAlerts();
+      const cachedDecisionsBeforeActiveSync = database.countDecisions();
+      const pruned = reconcileActiveDecisionAlerts(activeDecisionAlerts, new Date().toISOString());
+      activeDecisionAlertsCount = activeDecisionAlerts.length;
+      activeDecisionsCount = activeDecisionCount;
+      activeNetCachedAlerts = database.countAlerts() - cachedAlertsBeforeActiveSync;
+      activeNetCachedDecisions = database.countDecisions() - cachedDecisionsBeforeActiveSync;
+      activePrunedAlerts = pruned.alerts;
+      activePrunedDecisions = pruned.decisions;
     } catch (error: any) {
+      activeError = error.message;
       console.error('Failed to sync active decisions:', error.message);
     }
 
+    const cachedAlerts = database.countAlerts();
+    const cachedDecisions = database.countDecisions();
     updateSyncStatus({
       isSyncing: false,
       progress: 100,
-      message: `Sync complete. ${totalAlerts} alerts imported.`,
+      message: `Sync complete. ${cachedAlerts} alerts and ${cachedDecisions} decisions cached.`,
       completedAt: new Date().toISOString(),
     });
-    console.log(`Historical sync complete. Total imported: ${totalAlerts}`);
 
-    return totalAlerts;
+    return {
+      historicalAlerts: totalAlerts,
+      historicalDecisions: totalDecisions,
+      activeDecisionAlerts: activeDecisionAlertsCount,
+      activeDecisions: activeDecisionsCount,
+      activeNetCachedAlerts,
+      activeNetCachedDecisions,
+      activePrunedAlerts,
+      activePrunedDecisions,
+      activeError,
+      cachedAlerts,
+      cachedDecisions,
+    };
   }
 
   async function initializeCache(): Promise<boolean> {
@@ -1299,13 +1389,28 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     initializationPromise = (async () => {
       try {
         console.log('Initializing cache with chunked data load...');
-        await syncHistory();
+        const syncSummary = await syncHistory();
         cache.lastUpdate = new Date().toISOString();
         cache.isInitialized = true;
         lapiClient.updateStatus(true);
         await runNotificationEvaluation('cache initialization');
+        const activeDecisionChanged =
+          syncSummary.activeNetCachedAlerts !== 0 ||
+          syncSummary.activeNetCachedDecisions !== 0 ||
+          syncSummary.activePrunedAlerts !== 0 ||
+          syncSummary.activePrunedDecisions !== 0;
+        const activeDecisionSummary = syncSummary.activeError
+          ? `  Active decisions: failed (${syncSummary.activeError})`
+          : activeDecisionChanged
+            ? `  Active decisions:
+    Checked:      ${syncSummary.activeDecisionAlerts} alerts and ${syncSummary.activeDecisions} decisions
+    Cache change: ${formatSignedCount(syncSummary.activeNetCachedAlerts)} alerts and ${formatSignedCount(syncSummary.activeNetCachedDecisions)} decisions
+    Pruned stale: ${syncSummary.activePrunedAlerts} alerts and ${syncSummary.activePrunedDecisions} decisions`
+            : `  Active decisions: checked ${syncSummary.activeDecisionAlerts} alerts and ${syncSummary.activeDecisions} decisions; no cache changes`;
         console.log(`Cache initialized successfully:
-  Alerts: ${database.countAlerts()}
+  Historical: ${syncSummary.historicalAlerts} alerts and ${syncSummary.historicalDecisions} decisions fetched
+${activeDecisionSummary}
+  Cache: ${syncSummary.cachedAlerts} alerts and ${syncSummary.cachedDecisions} decisions
   Refresh Interval: ${getIntervalName(refreshIntervalMs)}
 `);
         return true;
@@ -1336,36 +1441,36 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     }
 
     try {
-      const diffSeconds = Math.ceil((Date.now() - new Date(cache.lastUpdate).getTime()) / 1_000) + 10;
+      const deltaStartedAt = Date.now();
+      const diffSeconds = Math.ceil((deltaStartedAt - new Date(cache.lastUpdate).getTime()) / 1_000) + 10;
       const sinceDuration = `${diffSeconds}s`;
+      const deltaStart = new Date(deltaStartedAt - diffSeconds * 1_000).toISOString();
+      const deltaEnd = new Date(deltaStartedAt).toISOString();
       console.log(`Fetching delta updates (since: ${sinceDuration})...`);
       const [newAlerts, activeDecisionAlerts] = await Promise.all([
-        fetchAlertsForSync(sinceDuration, null),
-        fetchAlertsForSync(null, null, true),
+        fetchAlertsForSync(sinceDuration, null, false, { requireComplete: true }),
+        fetchAlertsForSync(null, null, true, { requireComplete: true }),
       ]);
+      const newDecisionCount = countAlertDecisions(newAlerts);
+      const activeDecisionCount = countAlertDecisions(activeDecisionAlerts);
 
-      if (newAlerts.length > 0) {
-        const insertTransaction = database.transaction<AlertRecord[]>((alerts) => {
-          for (const alert of alerts) {
-            processAlertForDatabase(alert);
-          }
-        });
-        insertTransaction(newAlerts);
-        console.log(`Delta update: ${newAlerts.length} new alerts`);
+      const deltaPruned = reconcileSyncedAlertWindow(newAlerts, deltaStart, deltaEnd);
+      if (newAlerts.length > 0 || deltaPruned.alerts > 0 || deltaPruned.decisions > 0) {
+        console.log(
+          `Delta update: ${newAlerts.length} alerts and ${newDecisionCount} decisions synced, ${deltaPruned.alerts} stale alerts and ${deltaPruned.decisions} stale decisions pruned`,
+        );
       }
 
-      if (activeDecisionAlerts.length > 0) {
-        const refreshTransaction = database.transaction<AlertRecord[]>((alerts) => {
-          for (const alert of alerts) {
-            processAlertForDatabase(alert);
-          }
-        });
-        refreshTransaction(activeDecisionAlerts);
+      const activePruned = reconcileActiveDecisionAlerts(activeDecisionAlerts, new Date().toISOString());
+      if (activeDecisionAlerts.length > 0 || activePruned.alerts > 0 || activePruned.decisions > 0) {
+        console.log(
+          `Active decision refresh: ${activeDecisionAlerts.length} alerts and ${activeDecisionCount} decisions synced, ${activePruned.alerts} stale alerts and ${activePruned.decisions} stale decisions pruned`,
+        );
       }
 
       cache.lastUpdate = new Date().toISOString();
       lapiClient.updateStatus(true);
-      console.log(`Delta update complete: ${newAlerts.length} alerts, ${activeDecisionAlerts.length} active decision alerts refreshed`);
+      console.log(`Delta update complete: ${newAlerts.length} alerts and ${newDecisionCount} decisions synced, ${activeDecisionAlerts.length} active decision alerts and ${activeDecisionCount} decisions refreshed`);
     } catch (error: any) {
       console.error('Failed to update cache delta:', error.message);
       lapiClient.updateStatus(false, error);
@@ -1611,12 +1716,42 @@ export function createApp(options: CreateAppOptions = {}): AppController {
     return error.response?.status === 403;
   }
 
+  function isAlreadyGoneError(error: AnyError): boolean {
+    return error.response?.status === 404 || error.response?.status === 410;
+  }
+
   function toFailure(kind: 'alert' | 'decision', id: string, error: AnyError): BulkDeleteFailure {
     return {
       kind,
       id,
       error: error.message || 'Delete failed',
     };
+  }
+
+  async function deleteAlertFromLapi(id: string): Promise<unknown> {
+    try {
+      return await lapiClient.deleteAlert(id);
+    } catch (error) {
+      const typedError = error as AnyError;
+      if (isAlreadyGoneError(typedError)) {
+        console.log(`Alert ${id} is already missing in LAPI; removing local cache entry.`);
+        return { message: 'Deleted' };
+      }
+      throw typedError;
+    }
+  }
+
+  async function deleteDecisionFromLapi(id: string): Promise<unknown> {
+    try {
+      return await lapiClient.deleteDecision(id);
+    } catch (error) {
+      const typedError = error as AnyError;
+      if (isAlreadyGoneError(typedError)) {
+        console.log(`Decision ${id} is already missing in LAPI; removing local cache entry.`);
+        return { message: 'Deleted' };
+      }
+      throw typedError;
+    }
   }
 
   function getCachedAlertsForDeletion(): CachedAlertRecord[] {
@@ -1679,7 +1814,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
     for (const id of ids) {
       try {
-        await lapiClient.deleteAlert(id);
+        await deleteAlertFromLapi(id);
         deletedAlertIds.push(id);
 
         const alert = alertMap.get(id);
@@ -1726,7 +1861,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
     for (const id of ids) {
       try {
-        await lapiClient.deleteDecision(id);
+        await deleteDecisionFromLapi(id);
         deletedDecisionIds.push(id);
       } catch (error) {
         const typedError = error as AnyError;
@@ -1765,7 +1900,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
 
     for (const alert of alerts) {
       try {
-        await lapiClient.deleteAlert(alert.id);
+        await deleteAlertFromLapi(alert.id);
         deletedAlertIds.push(alert.id);
 
         try {
@@ -1795,7 +1930,7 @@ export function createApp(options: CreateAppOptions = {}): AppController {
       }
 
       try {
-        await lapiClient.deleteDecision(decision.id);
+        await deleteDecisionFromLapi(decision.id);
         deletedDecisionIds.add(decision.id);
       } catch (error) {
         const typedError = error as AnyError;
