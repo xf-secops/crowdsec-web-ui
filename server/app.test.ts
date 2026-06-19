@@ -718,6 +718,17 @@ describe('createApp', () => {
     expect(refreshUpdate.status).toBe(200);
     expect(((await refreshUpdate.json()) as { new_interval_ms: number }).new_interval_ms).toBe(5000);
 
+    const languageUpdate = await controller.fetch(
+      new Request('http://localhost/crowdsec/api/config/language', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ language: 'de' }),
+      }),
+    );
+    expect(languageUpdate.status).toBe(200);
+    expect(((await languageUpdate.json()) as { language: string }).language).toBe('de');
+    expect(database.getMeta('language')?.value).toBe('de');
+
     const columnUpdate = await controller.fetch(
       new Request('http://localhost/crowdsec/api/config/table-columns', {
         method: 'PUT',
@@ -2815,9 +2826,9 @@ describe('createApp', () => {
     destroyTempDir();
   });
 
-  test('keeps duration-only decision expiration stable across cache refreshes', async () => {
-    const createdAt = new Date(Date.now() - 5 * 60 * 1_000).toISOString();
-    const expectedStopAt = new Date(Date.parse(createdAt) + 4 * 60 * 60 * 1_000).toISOString();
+  test('treats duration-only decisions as remaining time from sync', async () => {
+    const remainingMs = 44 * 60 * 1_000 + 40 * 1_000;
+    const createdAt = new Date(Date.now() - 4 * 60 * 60 * 1_000).toISOString();
     const durationOnlyAlert = sampleManualWebUiAlert({
       id: 388,
       uuid: 'alert-388',
@@ -2827,7 +2838,7 @@ describe('createApp', () => {
           id: 3880,
           type: 'ban',
           value: '1.2.3.4',
-          duration: '4h',
+          duration: '44m40s',
           origin: 'cscli',
           scenario: 'manual/web-ui',
           simulated: false,
@@ -2848,13 +2859,29 @@ describe('createApp', () => {
       },
     });
 
+    const beforeRefresh = Date.now();
     const firstRefresh = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
+    const afterRefresh = Date.now();
     expect(firstRefresh.status).toBe(200);
-    expect(database.getDecisionById('3880')?.stop_at).toBe(expectedStopAt);
+    const cachedStopAt = Date.parse(database.getDecisionById('3880')?.stop_at || '');
+    expect(cachedStopAt).toBeGreaterThanOrEqual(beforeRefresh + remainingMs);
+    expect(cachedStopAt).toBeLessThanOrEqual(afterRefresh + remainingMs);
+    expect(cachedStopAt).toBeGreaterThan(Date.now());
 
-    const secondRefresh = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
-    expect(secondRefresh.status).toBe(200);
-    expect(database.getDecisionById('3880')?.stop_at).toBe(expectedStopAt);
+    const decisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions?page=1&page_size=50&alert_id=388&include_expired=true'));
+    expect(decisionsResponse.status).toBe(200);
+    const decisionsJson = await decisionsResponse.json() as {
+      data: Array<{ id: number; expired: boolean; detail: { duration: string } }>;
+      selectable_ids: number[];
+    };
+    expect(decisionsJson.data).toEqual([
+      expect.objectContaining({
+        id: 3880,
+        expired: false,
+        detail: expect.objectContaining({ duration: '44m40s' }),
+      }),
+    ]);
+    expect(decisionsJson.selectable_ids).toEqual([3880]);
 
     controller.stopBackgroundTasks();
     database.close();
