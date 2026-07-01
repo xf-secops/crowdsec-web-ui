@@ -20,6 +20,7 @@ import type { LucideIcon } from 'lucide-react';
 import { fetchConfig, fetchCrowdsecMetrics } from '../lib/api';
 import { useRefresh } from '../contexts/useRefresh';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/Card';
+import { Switch } from '../components/ui/Switch';
 import { useI18n } from '../lib/i18n';
 import type {
   CrowdsecMetricsApiEntity,
@@ -37,6 +38,8 @@ type MetricsState =
   | { status: 'disabled' }
   | { status: 'error'; message: string }
   | { status: 'ready'; data: CrowdsecMetricsResponse };
+
+const SHOW_CHILD_PARSER_NODES_STORAGE_KEY = 'crowdsec-web-ui:metrics:show-child-parser-nodes';
 
 function formatNumber(value: number): string {
   return Math.round(value).toLocaleString();
@@ -60,6 +63,30 @@ function formatOptionalNumber(value: number | null): string {
 
 function getErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+function readStoredShowChildParserNodes(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(SHOW_CHILD_PARSER_NODES_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function saveShowChildParserNodes(showChildParserNodes: boolean): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(SHOW_CHILD_PARSER_NODES_STORAGE_KEY, String(showChildParserNodes));
+  } catch {
+    // This is a convenience preference; metrics continue to render without storage.
+  }
 }
 
 type MetricTone = 'neutral' | 'success' | 'warning' | 'danger';
@@ -188,18 +215,27 @@ function SectionHeader({
   icon: Icon,
   title,
   description,
+  actions,
 }: {
   icon: LucideIcon;
   title: string;
   description: string;
+  actions?: ReactNode;
 }) {
   return (
-    <CardHeader>
-      <CardTitle className="flex items-center gap-2">
-        <Icon className="h-5 w-5 text-primary-600 dark:text-primary-400" />
-        {title}
-      </CardTitle>
-      <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">{description}</p>
+    <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0">
+        <CardTitle className="flex items-center gap-2">
+          <Icon className="h-5 w-5 text-primary-600 dark:text-primary-400" />
+          {title}
+        </CardTitle>
+        <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">{description}</p>
+      </div>
+      {actions && (
+        <div className="shrink-0 sm:pt-0.5">
+          {actions}
+        </div>
+      )}
     </CardHeader>
   );
 }
@@ -386,9 +422,32 @@ function ParserSourceList({ items }: { items: CrowdsecMetricsParserSource[] }) {
   );
 }
 
-function ParserNodeList({ items }: { items: CrowdsecMetricsParserNode[] }) {
+function AppsecActivityBar({ requests, blocked }: { requests: number; blocked: number }) {
+  const allowed = Math.max(requests - blocked, 0);
+  const total = requests > 0 ? requests : blocked;
+  const allowedPercent = total > 0 ? Math.max(0, Math.min(100, (allowed / total) * 100)) : 0;
+  const blockedPercent = total > 0 ? Math.max(0, Math.min(100, (blocked / total) * 100)) : 0;
+
+  return (
+    <div className="flex h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-700">
+      <div
+        className="h-full bg-emerald-500 transition-[width]"
+        style={{ width: `${allowedPercent}%` }}
+      />
+      <div
+        className="h-full bg-amber-500 transition-[width]"
+        style={{ width: `${blockedPercent}%` }}
+      />
+    </div>
+  );
+}
+
+function ParserNodeList({ items, showChildNodes, onShowChildNodesChange }: { items: CrowdsecMetricsParserNode[]; showChildNodes: boolean; onShowChildNodesChange: (next: boolean) => void }) {
   const { t } = useI18n();
   const notAvailable = t('pages.metrics.notAvailable');
+  const visibleItems = showChildNodes ? items : items.filter((item) => !item.isChild);
+  const switchId = 'show-child-parser-nodes';
+  const switchLabelId = `${switchId}-label`;
 
   return (
     <Card>
@@ -396,10 +455,20 @@ function ParserNodeList({ items }: { items: CrowdsecMetricsParserNode[] }) {
         icon={DatabaseZap}
         title={t('pages.metrics.parserNodes')}
         description={t('pages.metrics.parserNodesDescription')}
+        actions={items.length > 0 ? (
+          <div className="flex items-center gap-2 rounded-md border border-gray-100 bg-gray-50 px-2.5 py-1.5 dark:border-gray-700/70 dark:bg-gray-900/40">
+            <label id={switchLabelId} htmlFor={switchId} className="whitespace-nowrap text-xs font-medium text-gray-700 dark:text-gray-200">
+              {t('pages.metrics.showChildParserNodes')}
+            </label>
+            <Switch id={switchId} checked={showChildNodes} onCheckedChange={onShowChildNodesChange} ariaLabelledBy={switchLabelId} />
+          </div>
+        ) : undefined}
       />
       <CardContent>
         {items.length === 0 ? (
           <EmptyState message={t('pages.metrics.emptyParserNodes')} />
+        ) : visibleItems.length === 0 ? (
+          <EmptyState message={t('pages.metrics.emptyParserNodesAfterFilter')} />
         ) : (
           <div className="overflow-hidden rounded-lg border border-gray-100 dark:border-gray-700/70">
             <div className="hidden grid-cols-[minmax(0,2fr)_minmax(0,1fr)_110px_110px] gap-3 border-b border-gray-100 bg-gray-50 px-4 py-2 text-xs font-semibold uppercase text-gray-500 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-400 lg:grid">
@@ -409,7 +478,7 @@ function ParserNodeList({ items }: { items: CrowdsecMetricsParserNode[] }) {
               <span className="text-right">{t('pages.metrics.columns.success')}</span>
             </div>
             <div className="divide-y divide-gray-100 dark:divide-gray-700/70">
-              {items.map((item) => (
+              {visibleItems.map((item) => (
                 <div key={`${item.name}-${item.stage}-${item.source}-${item.acquisType || ''}`} className="grid gap-2 px-4 py-3 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_110px_110px] lg:items-center lg:gap-3">
                   <div className="min-w-0">
                     <p className="truncate font-medium text-gray-900 dark:text-white" title={item.name}>{item.name}</p>
@@ -573,6 +642,7 @@ function AppsecEngineList({ items }: { items?: CrowdsecMetricsAppsecEngine[] }) 
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {engines.map((item) => {
               const blockTone: MetricTone = item.blocked > 0 ? 'warning' : 'neutral';
+              const allowed = Math.max(item.requests - item.blocked, 0);
 
               return (
                 <div key={`${item.engine}-${item.source}`} className="rounded-lg border border-gray-100 p-4 dark:border-gray-700/70">
@@ -586,14 +656,18 @@ function AppsecEngineList({ items }: { items?: CrowdsecMetricsAppsecEngine[] }) 
                     </TooltipValue>
                   </div>
                   <div className="mt-4">
-                    <ProgressBar value={item.blockRate} tone={blockTone} />
+                    <AppsecActivityBar requests={item.requests} blocked={item.blocked} />
                   </div>
-                  <div className="mt-3 grid grid-cols-2 gap-2 text-center text-xs">
-                    <div>
+                  <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+                    <div className="text-left">
                       <p className="font-mono text-sm font-semibold text-gray-900 dark:text-white">{formatNumber(item.requests)}</p>
                       <p className="text-gray-500 dark:text-gray-400">{t('pages.metrics.labels.requests')}</p>
                     </div>
-                    <div>
+                    <div className="text-center">
+                      <p className="font-mono text-sm font-semibold text-emerald-700 dark:text-emerald-300">{formatNumber(allowed)}</p>
+                      <p className="text-gray-500 dark:text-gray-400">{t('pages.metrics.labels.allowed')}</p>
+                    </div>
+                    <div className="text-right">
                       <p className="font-mono text-sm font-semibold text-amber-700 dark:text-amber-300">{formatNumber(item.blocked)}</p>
                       <p className="text-gray-500 dark:text-gray-400">{t('pages.metrics.labels.blocked')}</p>
                     </div>
@@ -612,6 +686,12 @@ export function Metrics() {
   const { t } = useI18n();
   const { refreshSignal, setLastUpdated } = useRefresh();
   const [state, setState] = useState<MetricsState>({ status: 'loading' });
+  const [showChildParserNodes, setShowChildParserNodes] = useState(readStoredShowChildParserNodes);
+
+  const handleShowChildParserNodesChange = useCallback((next: boolean) => {
+    setShowChildParserNodes(next);
+    saveShowChildParserNodes(next);
+  }, []);
 
   const load = useCallback(async (background = false) => {
     if (!background) setState({ status: 'loading' });
@@ -722,11 +802,11 @@ export function Metrics() {
         <ParserSourceList items={data.parserSources} />
         <TimingList items={data.parserTimings} />
         <LapiLatencyList items={data.lapiRoutes} />
-        <ParserNodeList items={data.parserNodes} />
+        <ParserNodeList items={data.parserNodes} showChildNodes={showChildParserNodes} onShowChildNodesChange={handleShowChildParserNodesChange} />
         <WhitelistList items={data.whitelists} />
       </div>
     );
-  }, [load, state, t]);
+  }, [handleShowChildParserNodesChange, load, showChildParserNodes, state, t]);
 
   return content;
 }
