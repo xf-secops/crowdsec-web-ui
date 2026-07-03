@@ -66,7 +66,7 @@ These routes are mounted below `/api/auth`. Auth setup/login routes are availabl
 | POST | `/api/auth/logout` | Clear the session cookie. |
 | GET | `/api/auth/me` | Current authenticated session user. |
 | GET | `/api/auth/settings` | Auth settings visible to the current user, including OIDC settings metadata and password/passkey state. |
-| PUT | `/api/auth/settings` | Admin-only auth settings update. Can disable password login and configure OIDC issuer, client ID, client secret, groups claim, admin groups, read-only groups, and unmatched-user policy. |
+| PUT | `/api/auth/settings` | Admin-only auth settings update. Can disable password login and configure OIDC issuer, client ID, client secret, scopes, groups claim, admin groups, read-only groups, and unmatched-user policy. |
 | POST | `/api/auth/change-password` | Change the current user's password. The user must be logged in with password auth. |
 | GET | `/api/auth/passkeys` | List passkeys for the current user. |
 | PATCH | `/api/auth/passkeys/:id` | Rename a passkey with `{ "name": "..." }`. |
@@ -82,15 +82,10 @@ These routes are mounted below `/api/auth`. Auth setup/login routes are availabl
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| GET | `/api/config` | Runtime UI config, LAPI status, sync status, simulation setting, table column preferences, time settings, metrics availability, metrics sidebar preference, and permissions. |
+| GET | `/api/config` | Runtime UI config, LAPI status, sync status, simulation setting, time settings, metrics availability, metrics sidebar preference, and permissions. |
 | PUT | `/api/config/metrics-sidebar` | Save the metrics sidebar preference. Body: `{ "visible": true }`. |
-| PUT | `/api/config/table-columns` | Save visible columns for one table and viewport. Body: `{ "table": "alerts" \| "decisions", "viewport": "desktop" \| "mobile", "visible_columns": [...] }`. |
 | PUT | `/api/config/refresh-interval` | Update the refresh interval. Body: `{ "interval": "manual" \| "0" \| "5s" \| "30s" \| "1m" \| "5m" }`. Blocked in read-only mode. |
 | PUT | `/api/config/language` | Save language preference. Body: `{ "language": "browser" }` or a supported locale code. |
-
-Alert columns: `id`, `time`, `scenario`, `country`, `as`, `source`, `machine`, `origin`, `decisions`.
-
-Decision columns: `id`, `time`, `scenario`, `country`, `as`, `source`, `action`, `expiration`, `machine`, `origin`, `alert`.
 
 ## Alerts
 

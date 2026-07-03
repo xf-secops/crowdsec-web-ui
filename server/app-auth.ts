@@ -11,7 +11,7 @@ import {
   type VerifiedRegistrationResponse,
 } from '@simplewebauthn/server';
 import * as oidcClient from 'openid-client';
-import { parseOidcUnmatchedRole, type DashboardAuthConfig, type OidcUnmatchedRole } from './config';
+import { parseOidcScope, parseOidcUnmatchedRole, type DashboardAuthConfig, type OidcUnmatchedRole } from './config';
 import { CrowdsecDatabase, type AuthUserRow } from './database';
 
 type HonoContext = any;
@@ -23,6 +23,7 @@ type MutableAuthSettingKey =
   | 'oidc_issuer_url'
   | 'oidc_client_id'
   | 'oidc_client_secret'
+  | 'oidc_scope'
   | 'oidc_groups_claim'
   | 'oidc_admin_groups'
   | 'oidc_read_only_groups'
@@ -32,6 +33,7 @@ interface EffectiveAuthConfig {
   oidcIssuerUrl?: string;
   oidcClientId?: string;
   oidcClientSecret?: string;
+  oidcScope: string;
   oidcGroupsClaim: string;
   oidcAdminGroups: string[];
   oidcReadOnlyGroups: string[];
@@ -376,7 +378,7 @@ class OidcRuntime {
       client_id: config.oidcClientId!,
       redirect_uri: redirectUri,
       response_type: 'code',
-      scope: 'openid profile email',
+      scope: config.oidcScope,
       state,
       nonce,
     });
@@ -430,6 +432,7 @@ export function createDashboardAuth(options: {
       oidcIssuerUrl: readAuthSetting(database, 'oidc_issuer_url') ?? config.oidcIssuerUrl,
       oidcClientId: readAuthSetting(database, 'oidc_client_id') ?? config.oidcClientId,
       oidcClientSecret,
+      oidcScope: readAuthSetting(database, 'oidc_scope')?.trim() || config.oidcScope,
       oidcGroupsClaim: readAuthSetting(database, 'oidc_groups_claim') || config.oidcGroupsClaim || 'groups',
       oidcAdminGroups: parseCsvList(readAuthSetting(database, 'oidc_admin_groups') ?? config.oidcAdminGroups.join(',')),
       oidcReadOnlyGroups: parseCsvList(readAuthSetting(database, 'oidc_read_only_groups') ?? config.oidcReadOnlyGroups.join(',')),
@@ -604,6 +607,7 @@ export function createDashboardAuth(options: {
         oidcIssuerUrl: effectiveConfig.oidcIssuerUrl || '',
         oidcClientId: effectiveConfig.oidcClientId || '',
         hasOidcClientSecret: Boolean(effectiveConfig.oidcClientSecret),
+        oidcScope: effectiveConfig.oidcScope,
         oidcGroupsClaim: effectiveConfig.oidcGroupsClaim,
         oidcAdminGroups: effectiveConfig.oidcAdminGroups.join(','),
         oidcReadOnlyGroups: effectiveConfig.oidcReadOnlyGroups.join(','),
@@ -638,6 +642,19 @@ export function createDashboardAuth(options: {
           ? body.oidcGroupsClaim.trim()
           : 'groups';
         writeAuthSetting(database, 'oidc_groups_claim', groupsClaim);
+      }
+
+      if ('oidcScope' in body) {
+        let scope: string;
+        try {
+          const scopeInput = typeof body.oidcScope === 'string' && body.oidcScope.trim()
+            ? body.oidcScope
+            : config.oidcScope;
+          scope = parseOidcScope(scopeInput);
+        } catch {
+          return context.json({ error: 'OIDC scopes must include openid' }, 400);
+        }
+        writeAuthSetting(database, 'oidc_scope', scope);
       }
 
       if ('oidcAdminGroups' in body) {
@@ -693,6 +710,7 @@ export function createDashboardAuth(options: {
           oidcIssuerUrl: effectiveConfig.oidcIssuerUrl || '',
           oidcClientId: effectiveConfig.oidcClientId || '',
           hasOidcClientSecret: Boolean(effectiveConfig.oidcClientSecret),
+          oidcScope: effectiveConfig.oidcScope,
           oidcGroupsClaim: effectiveConfig.oidcGroupsClaim,
           oidcAdminGroups: effectiveConfig.oidcAdminGroups.join(','),
           oidcReadOnlyGroups: effectiveConfig.oidcReadOnlyGroups.join(','),

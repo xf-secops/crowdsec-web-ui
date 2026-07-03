@@ -625,6 +625,7 @@ test('dashboard auth exposes account settings and password changes', async () =>
     oidcIssuerUrl: '',
     oidcClientId: '',
     hasOidcClientSecret: false,
+    oidcScope: 'openid profile email',
     oidcGroupsClaim: 'groups',
     oidcAdminGroups: '',
     oidcReadOnlyGroups: '',
@@ -660,6 +661,7 @@ test('dashboard auth exposes account settings and password changes', async () =>
     headers: { 'Content-Type': 'application/json', cookie },
     body: JSON.stringify({
       oidcGroupsClaim: 'roles',
+      oidcScope: 'openid profile email groups offline_access',
       oidcAdminGroups: 'admins, secops, admins',
       oidcReadOnlyGroups: 'viewers',
       oidcUnmatchedRole: 'admin',
@@ -669,10 +671,21 @@ test('dashboard auth exposes account settings and password changes', async () =>
   expect(await saveGroupMapping.json()).toMatchObject({
     settings: {
       oidcGroupsClaim: 'roles',
+      oidcScope: 'openid profile email groups offline_access',
       oidcAdminGroups: 'admins,secops',
       oidcReadOnlyGroups: 'viewers',
       oidcUnmatchedRole: 'admin',
     },
+  });
+
+  const invalidScope = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', cookie },
+    body: JSON.stringify({ oidcScope: 'profile email groups' }),
+  }));
+  expect(invalidScope.status).toBe(400);
+  expect(await invalidScope.json()).toMatchObject({
+    error: 'OIDC scopes must include openid',
   });
 
   const disableWithoutAlternative = await controller.fetch(new Request('http://localhost/crowdsec/api/auth/settings', {
@@ -718,6 +731,7 @@ test('dashboard auth settings use OIDC environment values as defaults', async ()
       CROWDSEC_AUTH_OIDC_ISSUER_URL: 'https://idp.example.com/application/o/crowdsec/',
       CROWDSEC_AUTH_OIDC_CLIENT_ID: 'crowdsec-client',
       CROWDSEC_AUTH_OIDC_CLIENT_SECRET: 'oidc-secret',
+      CROWDSEC_AUTH_OIDC_SCOPE: 'openid profile email roles',
       CROWDSEC_AUTH_OIDC_GROUPS_CLAIM: 'roles',
       CROWDSEC_AUTH_OIDC_ADMIN_GROUPS: 'admins,secops',
       CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS: 'viewers',
@@ -740,6 +754,7 @@ test('dashboard auth settings use OIDC environment values as defaults', async ()
     oidcIssuerUrl: 'https://idp.example.com/application/o/crowdsec/',
     oidcClientId: 'crowdsec-client',
     hasOidcClientSecret: true,
+    oidcScope: 'openid profile email roles',
     oidcGroupsClaim: 'roles',
     oidcAdminGroups: 'admins,secops',
     oidcReadOnlyGroups: 'viewers',
@@ -923,7 +938,6 @@ describe('createApp', () => {
       origin_features_enabled: boolean;
       metrics_enabled: boolean;
       metrics_sidebar_visible: boolean;
-      table_column_preferences: { alerts: { desktop: string[]; mobile: string[] }; decisions: { desktop: string[]; mobile: string[] } };
       permissions: { mode: string; can_manage_enforcement: boolean; can_manage_settings: boolean };
     })).toEqual(
       expect.objectContaining({
@@ -937,16 +951,6 @@ describe('createApp', () => {
           mode: 'admin',
           can_manage_enforcement: true,
           can_manage_settings: true,
-        },
-        table_column_preferences: {
-          alerts: {
-            desktop: ['time', 'scenario', 'country', 'as', 'source', 'decisions'],
-            mobile: ['time', 'scenario', 'country', 'as', 'source', 'decisions'],
-          },
-          decisions: {
-            desktop: ['time', 'scenario', 'country', 'as', 'source', 'action', 'expiration', 'alert'],
-            mobile: ['time', 'scenario', 'country', 'as', 'source', 'action', 'expiration', 'alert'],
-          },
         },
       }),
     );
@@ -1045,70 +1049,6 @@ describe('createApp', () => {
     expect(languageUpdate.status).toBe(200);
     expect(((await languageUpdate.json()) as { language: string }).language).toBe('de');
     expect(database.getMeta('language')?.value).toBe('de');
-
-    const columnUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'alerts', visible_columns: ['id', 'time', 'machine', 'origin'] }),
-      }),
-    );
-    expect(columnUpdate.status).toBe(200);
-    expect((await columnUpdate.json()) as { table_column_preferences: { alerts: { desktop: string[] } } }).toEqual(
-      expect.objectContaining({
-        table_column_preferences: expect.objectContaining({
-          alerts: expect.objectContaining({
-            desktop: ['id', 'time', 'machine', 'origin'],
-          }),
-        }),
-      }),
-    );
-
-    const mobileColumnUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'alerts', viewport: 'mobile', visible_columns: ['id', 'source'] }),
-      }),
-    );
-    expect(mobileColumnUpdate.status).toBe(200);
-    expect((await mobileColumnUpdate.json()) as { table_column_preferences: { alerts: { desktop: string[]; mobile: string[] } } }).toEqual(
-      expect.objectContaining({
-        table_column_preferences: expect.objectContaining({
-          alerts: expect.objectContaining({
-            desktop: ['id', 'time', 'machine', 'origin'],
-            mobile: ['id', 'source'],
-          }),
-        }),
-      }),
-    );
-
-    const invalidColumnUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'alerts', visible_columns: ['time', 'alert'] }),
-      }),
-    );
-    expect(invalidColumnUpdate.status).toBe(400);
-
-    const invalidTableUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'dashboard', visible_columns: ['time'] }),
-      }),
-    );
-    expect(invalidTableUpdate.status).toBe(400);
-
-    const invalidViewportUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'alerts', viewport: 'tablet', visible_columns: ['time'] }),
-      }),
-    );
-    expect(invalidViewportUpdate.status).toBe(400);
 
     const addDecision = await controller.fetch(
       new Request('http://localhost/crowdsec/api/decisions', {
@@ -1284,15 +1224,6 @@ describe('createApp', () => {
       }),
     );
     expect(languageUpdate.status).toBe(200);
-
-    const columnUpdate = await controller.fetch(
-      new Request('http://localhost/crowdsec/api/config/table-columns', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ table: 'alerts', visible_columns: ['time', 'source'] }),
-      }),
-    );
-    expect(columnUpdate.status).toBe(200);
 
     const markRead = await controller.fetch(new Request('http://localhost/crowdsec/api/notifications/notif-1/read', { method: 'POST' }));
     expect(markRead.status).toBe(200);
@@ -1536,7 +1467,7 @@ describe('createApp', () => {
     destroyTempDir();
   });
 
-  test('reports table column defaults and includes machine in decision payloads', async () => {
+  test('includes machine in decision payloads', async () => {
     const firstAlert = sampleAlert({
       id: 101,
       uuid: 'alert-101',
@@ -1589,22 +1520,6 @@ describe('createApp', () => {
 
     const alertsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/alerts'));
     expect(alertsResponse.status).toBe(200);
-
-    const configResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/config'));
-    expect((await configResponse.json()) as { table_column_preferences: { alerts: { desktop: string[]; mobile: string[] }; decisions: { desktop: string[]; mobile: string[] } } }).toEqual(
-      expect.objectContaining({
-        table_column_preferences: expect.objectContaining({
-          alerts: expect.objectContaining({
-            desktop: expect.not.arrayContaining(['id', 'machine', 'origin']),
-            mobile: expect.not.arrayContaining(['id', 'machine', 'origin']),
-          }),
-          decisions: expect.objectContaining({
-            desktop: expect.not.arrayContaining(['id', 'machine', 'origin']),
-            mobile: expect.not.arrayContaining(['id', 'machine', 'origin']),
-          }),
-        }),
-      }),
-    );
 
     const decisionsResponse = await controller.fetch(new Request('http://localhost/crowdsec/api/decisions'));
     expect(decisionsResponse.status).toBe(200);

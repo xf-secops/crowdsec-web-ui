@@ -64,7 +64,7 @@ A self-hosted web dashboard for [CrowdSec](https://crowdsec.net/) to review aler
 
 > [!CAUTION]
 > **Security Notice**: CrowdSec Web UI includes built-in authentication, but public deployments should still run behind HTTPS and a hardened reverse proxy. For centralized access control, configure OIDC SSO with an Identity Provider (IdP) such as [Authentik](https://goauthentik.io/), [Authelia](https://www.authelia.com/), or [Keycloak](https://www.keycloak.org/). Existing installs upgraded from versions without authentication remain unauthenticated until `AUTH_ENABLED=true` is set.
-> Set `PERMISSION_READ_ONLY=true` to run an instance that can view data but cannot perform CrowdSec write actions or management actions such as changing refresh cadence, managing notification destinations/rules, sending notification tests, or deleting notifications. Language, table column preferences, and marking notifications as read remain writable. This is an instance-wide safety mode, not user management or per-user RBAC.
+> Set `PERMISSION_READ_ONLY=true` to run an instance that can view data but cannot perform CrowdSec write actions or management actions such as changing refresh cadence, managing notification destinations/rules, sending notification tests, or deleting notifications. Language and marking notifications as read remain writable. This is an instance-wide safety mode, not user management or per-user RBAC.
 
 ## Architecture
 
@@ -257,7 +257,7 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `DB_DIR` | `/app/data` | Directory that stores the SQLite database and other persisted app data. If you change it, update your volume mounts too. |
 | `TZ` | browser local | Optional deployment-wide IANA timezone, such as `Europe/Berlin` or `UTC`. When set, the UI, dashboard grouping, filters, and server-generated timestamps all use it. |
 | `CROWDSEC_TIME_FORMAT` | browser locale | Optional deployment-wide clock format. Accepts `12h` or `24h`. When omitted, each browser's locale determines whether the UI uses a 12- or 24-hour clock. |
-| `PERMISSION_READ_ONLY` | `false` | Set to `true` to hide management actions in the UI and reject API requests that add/delete decisions, delete alerts, clean up by IP, clear the cache, change refresh cadence, manage notification destinations/rules, send notification tests, or delete notifications. Language, table column preferences, and marking notifications as read remain writable. |
+| `PERMISSION_READ_ONLY` | `false` | Set to `true` to hide management actions in the UI and reject API requests that add/delete decisions, delete alerts, clean up by IP, clear the cache, change refresh cadence, manage notification destinations/rules, send notification tests, or delete notifications. Language and marking notifications as read remain writable. |
 | `AUTH_ENABLED` | new installs: `true`; migrated existing installs: `false` | Enables authentication for the UI and API. Set to `false` to run without login. Existing databases from older releases are marked disabled during migration so upgrades do not lock out current deployments. |
 | `CROWDSEC_AUTH_SECRET` | auto-generated and persisted | Optional fixed secret used to sign session cookies. If unset, the app generates one and stores it in app metadata. |
 | `CROWDSEC_AUTH_SECRET_FILE` | auto-generated and persisted | Optional Docker Secrets alternative: read `CROWDSEC_AUTH_SECRET` from a file. Do not set both variables. |
@@ -265,6 +265,7 @@ Choose exactly one auth mode: password auth or mTLS auth.
 | `CROWDSEC_AUTH_OIDC_CLIENT_ID` | none | Optional OIDC client ID. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_CLIENT_SECRET` | none | Optional OIDC client secret. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_CLIENT_SECRET_FILE` | none | Optional Docker Secrets alternative: read `CROWDSEC_AUTH_OIDC_CLIENT_SECRET` from a file. Do not set both variables. |
+| `CROWDSEC_AUTH_OIDC_SCOPE` | `openid profile email` | Optional OIDC authorization scope string. Must include `openid`. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_GROUPS_CLAIM` | `groups` | Optional OIDC claim used for group mapping. The claim may be an array or a comma-separated string. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_ADMIN_GROUPS` | empty | Optional comma-separated OIDC groups that receive admin permissions. Can also be configured from Settings. |
 | `CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS` | empty | Optional comma-separated OIDC groups that receive read-only permissions. Can also be configured from Settings. |
@@ -315,13 +316,14 @@ AUTH_ENABLED=true
 CROWDSEC_AUTH_OIDC_ISSUER_URL=https://idp.example.com/application/o/crowdsec-web-ui/
 CROWDSEC_AUTH_OIDC_CLIENT_ID=crowdsec-web-ui
 CROWDSEC_AUTH_OIDC_CLIENT_SECRET=change-me
+CROWDSEC_AUTH_OIDC_SCOPE="openid profile email"
 CROWDSEC_AUTH_OIDC_GROUPS_CLAIM=groups
 CROWDSEC_AUTH_OIDC_ADMIN_GROUPS=crowdsec-admins,secops
 CROWDSEC_AUTH_OIDC_READ_ONLY_GROUPS=crowdsec-viewers
 CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE=deny
 ```
 
-OIDC Settings accepts the issuer URL, client ID, client secret, groups claim, admin groups, read-only groups, and the unmatched-user policy. Saved Settings values override OIDC environment defaults. By default, OIDC users who match no configured group are denied. Set the unmatched-user policy to `admin` or `read-only` only when every user who can complete OIDC sign-in should receive that fallback role.
+OIDC Settings accepts the issuer URL, client ID, client secret, authorization scopes, groups claim, admin groups, read-only groups, and the unmatched-user policy. Saved Settings values override OIDC environment defaults. Authorization scopes must include `openid`; add provider-specific scopes such as `groups` only when your IdP requires them for the configured groups claim. By default, OIDC users who match no configured group are denied. Set the unmatched-user policy to `admin` or `read-only` only when every user who can complete OIDC sign-in should receive that fallback role.
 
 OIDC group mapping is lightweight RBAC. `PERMISSION_READ_ONLY=true` is still instance-wide and overrides user roles. For OIDC, admin group matches get full access, read-only group matches can view data and keep allowed preferences, and users with no matching group follow `CROWDSEC_AUTH_OIDC_UNMATCHED_ROLE`.
 
@@ -505,7 +507,7 @@ CrowdSec simulation mode generates alerts and decisions without live remediation
 
 ### Table Column Visibility
 
-The Alerts and Decisions tables include a Columns button. Desktop and mobile layouts are saved separately in the application database and apply globally. `ID`, `Machine`, and `Origin` are hidden by default; `Machine` prefers `machine_alias` and falls back to `machine_id`; alerts with multiple decision origins show `Mixed`. Hidden columns remain searchable with advanced fields such as `id:`, `machine:`, and `origin:`.
+The Alerts and Decisions tables include a Columns button. Column layouts are saved in the browser's local storage, so each browser profile can keep its own table layout. `ID`, `Machine`, and `Origin` are hidden by default; `Machine` prefers `machine_alias` and falls back to `machine_id`; alerts with multiple decision origins show `Mixed`. Hidden columns remain searchable with advanced fields such as `id:`, `machine:`, and `origin:`.
 
 ### Search Syntax
 
