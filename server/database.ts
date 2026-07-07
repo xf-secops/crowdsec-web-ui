@@ -88,6 +88,9 @@ export interface AuthUserRow {
   id: number;
   username: string;
   password_hash: string | null;
+  totp_secret: string | null;
+  totp_enabled: number;
+  totp_last_step: number | null;
   role: 'admin' | 'read-only';
   auth_provider: 'password' | 'oidc';
   created_at: string;
@@ -136,6 +139,8 @@ export class CrowdsecDatabase {
   private readonly getAuthUserByIdStatement: any;
   private readonly getAuthUserByUsernameStatement: any;
   private readonly updateAuthUserPasswordStatement: any;
+  private readonly updateAuthUserTotpStatement: any;
+  private readonly updateAuthUserTotpLastStepStatement: any;
   private readonly upsertOidcUserStatement: any;
   private readonly listWebAuthnCredentialsByUserStatement: any;
   private readonly countWebAuthnCredentialsStatement: any;
@@ -261,6 +266,16 @@ export class CrowdsecDatabase {
       UPDATE auth_users
       SET password_hash = $password_hash, updated_at = $updated_at
       WHERE id = $id
+    `);
+    this.updateAuthUserTotpStatement = this.db.query(`
+      UPDATE auth_users
+      SET totp_secret = $totp_secret, totp_enabled = $totp_enabled, totp_last_step = $totp_last_step, updated_at = $updated_at
+      WHERE id = $id
+    `);
+    this.updateAuthUserTotpLastStepStatement = this.db.query(`
+      UPDATE auth_users
+      SET totp_last_step = $totp_last_step, updated_at = $updated_at
+      WHERE id = $id AND (totp_last_step IS NULL OR totp_last_step < $totp_last_step)
     `);
     this.upsertOidcUserStatement = this.db.query(`
       INSERT INTO auth_users (username, password_hash, role, auth_provider, created_at, updated_at)
@@ -587,6 +602,24 @@ export class CrowdsecDatabase {
     return this.updateAuthUserPasswordStatement.run({
       $id: id,
       $password_hash: passwordHash,
+      $updated_at: new Date().toISOString(),
+    }).changes > 0;
+  }
+
+  updateAuthUserTotp(id: number, secret: string | null, enabled: boolean): boolean {
+    return this.updateAuthUserTotpStatement.run({
+      $id: id,
+      $totp_secret: secret,
+      $totp_enabled: enabled ? 1 : 0,
+      $totp_last_step: null,
+      $updated_at: new Date().toISOString(),
+    }).changes > 0;
+  }
+
+  updateAuthUserTotpLastStep(id: number, lastStep: number): boolean {
+    return this.updateAuthUserTotpLastStepStatement.run({
+      $id: id,
+      $totp_last_step: lastStep,
       $updated_at: new Date().toISOString(),
     }).changes > 0;
   }
@@ -951,6 +984,9 @@ function initSchema(db: Database, freshDatabase: boolean): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT,
+      totp_secret TEXT,
+      totp_enabled INTEGER NOT NULL DEFAULT 0,
+      totp_last_step INTEGER,
       role TEXT NOT NULL DEFAULT 'admin',
       auth_provider TEXT NOT NULL DEFAULT 'password',
       created_at TEXT NOT NULL,
@@ -1097,8 +1133,22 @@ function initSchema(db: Database, freshDatabase: boolean): void {
 
   migrateNotificationRulesTable(db, createNotificationRulesTable);
   migrateNotificationsTable(db, createNotificationsTable);
+  migrateAuthUsersTable(db);
   db.exec(createNotificationIncidentsTable);
   seedNotificationIncidentsFromHistoryIfEmpty(db);
+}
+
+function migrateAuthUsersTable(db: Database): void {
+  const columns = db.query('PRAGMA table_info(auth_users)').all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === 'totp_secret')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN totp_secret TEXT');
+  }
+  if (!columns.some((column) => column.name === 'totp_enabled')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!columns.some((column) => column.name === 'totp_last_step')) {
+    db.exec('ALTER TABLE auth_users ADD COLUMN totp_last_step INTEGER');
+  }
 }
 
 function migrateNotificationRulesTable(db: Database, createNotificationRulesTable: string): void {
