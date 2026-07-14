@@ -6,6 +6,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import type { AlertDecision, AlertRecord } from '../shared/contracts';
 import { matchesIpSearchValue } from '../shared/search';
 import { deriveAlertIndexValues, deriveAlertIndexValuesFromRecord, deriveDecisionIndexValues, deriveDecisionIndexValuesFromRecord } from './record-index';
+import { normalizeCrowdsecTimestampJson, normalizeIsoTimestamp, normalizeTimestampJson } from './utils/date-time';
 
 type SqliteStatement = {
   run: (...params: any[]) => { changes: number };
@@ -23,6 +24,64 @@ type Database = {
 };
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const SYNC_SECONDARY_INDEX_NAMES = [
+  'idx_alerts_created_at',
+  'idx_alerts_country',
+  'idx_alerts_scenario',
+  'idx_alerts_as_name',
+  'idx_alerts_target',
+  'idx_alerts_source_ip',
+  'idx_alerts_simulated',
+  'idx_alerts_simulated_created_at',
+  'idx_alerts_country_created_at',
+  'idx_alerts_scenario_created_at',
+  'idx_decisions_stop_at',
+  'idx_decisions_alert_id',
+  'idx_decisions_value',
+  'idx_decisions_created_at',
+  'idx_decisions_stop_alert_id',
+  'idx_decisions_value_stop_at',
+  'idx_decisions_country',
+  'idx_decisions_scenario',
+  'idx_decisions_as_name',
+  'idx_decisions_target',
+  'idx_decisions_simulated',
+  'idx_decisions_simulated_created_at',
+  'idx_decisions_alert_created_id',
+  'idx_decisions_duplicate_active',
+  'idx_decisions_duplicate_created_at',
+  'idx_decisions_duplicate_primary',
+] as const;
+
+const CREATE_SYNC_SECONDARY_INDEXES_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
+  CREATE INDEX IF NOT EXISTS idx_alerts_country ON alerts(country);
+  CREATE INDEX IF NOT EXISTS idx_alerts_scenario ON alerts(scenario);
+  CREATE INDEX IF NOT EXISTS idx_alerts_as_name ON alerts(as_name);
+  CREATE INDEX IF NOT EXISTS idx_alerts_target ON alerts(target);
+  CREATE INDEX IF NOT EXISTS idx_alerts_source_ip ON alerts(source_ip);
+  CREATE INDEX IF NOT EXISTS idx_alerts_simulated ON alerts(simulated);
+  CREATE INDEX IF NOT EXISTS idx_alerts_simulated_created_at ON alerts(simulated, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_alerts_country_created_at ON alerts(country, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alerts_scenario_created_at ON alerts(scenario, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_decisions_stop_at ON decisions(stop_at);
+  CREATE INDEX IF NOT EXISTS idx_decisions_alert_id ON decisions(alert_id);
+  CREATE INDEX IF NOT EXISTS idx_decisions_value ON decisions(value);
+  CREATE INDEX IF NOT EXISTS idx_decisions_created_at ON decisions(created_at);
+  CREATE INDEX IF NOT EXISTS idx_decisions_stop_alert_id ON decisions(stop_at, alert_id);
+  CREATE INDEX IF NOT EXISTS idx_decisions_value_stop_at ON decisions(value, stop_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_decisions_country ON decisions(country);
+  CREATE INDEX IF NOT EXISTS idx_decisions_scenario ON decisions(scenario);
+  CREATE INDEX IF NOT EXISTS idx_decisions_as_name ON decisions(as_name);
+  CREATE INDEX IF NOT EXISTS idx_decisions_target ON decisions(target);
+  CREATE INDEX IF NOT EXISTS idx_decisions_simulated ON decisions(simulated);
+  CREATE INDEX IF NOT EXISTS idx_decisions_simulated_created_at ON decisions(simulated, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_decisions_alert_created_id ON decisions(alert_id, created_at DESC, id DESC, stop_at);
+  CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_active ON decisions(is_duplicate, stop_at, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_created_at ON decisions(is_duplicate, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_primary ON decisions(value, simulated, stop_at DESC, id);
+`;
 
 export interface AlertInsertParams {
   $id: string | number;
@@ -61,6 +120,7 @@ export interface DatabaseOptions {
 }
 
 type RowWithRawData = { raw_data: string; created_at?: string; stop_at?: string; alert_id?: string | number | null };
+export type DecisionDataRow = { raw_data: string; stop_at: string; alert_id?: string | number | null };
 type MetaRow = { value: string };
 type CountRow = { count: number };
 type IdRow = { id: string | number };
@@ -208,11 +268,11 @@ export class CrowdsecDatabase {
     this.insertAlertStatement = this.db.query(`
       INSERT INTO alerts (
         id, uuid, created_at, scenario, source_ip, message, raw_data,
-        country, country_name, as_name, target, machine, meta_search, origins, simulated, search_text
+        latitude, longitude, country, country_name, as_name, target, machine, meta_search, origins, simulated, search_text
       )
       VALUES (
         $id, $uuid, $created_at, $scenario, $source_ip, $message, $raw_data,
-        $country, $country_name, $as_name, $target, $machine, $meta_search, $origins, $simulated, $search_text
+        $latitude, $longitude, $country, $country_name, $as_name, $target, $machine, $meta_search, $origins, $simulated, $search_text
       )
       ON CONFLICT(id) DO UPDATE SET
         uuid = excluded.uuid,
@@ -221,6 +281,8 @@ export class CrowdsecDatabase {
         source_ip = excluded.source_ip,
         message = excluded.message,
         raw_data = excluded.raw_data,
+        latitude = excluded.latitude,
+        longitude = excluded.longitude,
         country = excluded.country,
         country_name = excluded.country_name,
         as_name = excluded.as_name,
@@ -236,6 +298,8 @@ export class CrowdsecDatabase {
         OR alerts.source_ip IS NOT excluded.source_ip
         OR alerts.message IS NOT excluded.message
         OR alerts.raw_data IS NOT excluded.raw_data
+        OR alerts.latitude IS NOT excluded.latitude
+        OR alerts.longitude IS NOT excluded.longitude
         OR alerts.country IS NOT excluded.country
         OR alerts.country_name IS NOT excluded.country_name
         OR alerts.as_name IS NOT excluded.as_name
@@ -557,16 +621,20 @@ export class CrowdsecDatabase {
   }
 
   beginDeferredSearchIndexUpdates(): void {
-    if (!this.searchIndexAvailable) return;
     this.searchIndexUpdatesDeferred = true;
-    this.clearSearchIndexes();
+    if (this.searchIndexAvailable) this.clearSearchIndexes();
+    for (const indexName of SYNC_SECONDARY_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+    }
   }
 
   rebuildSearchIndexes(): void {
-    if (!this.searchIndexAvailable) return;
     try {
-      this.clearSearchIndexes();
-      backfillSearchIndexes(this.db);
+      this.db.exec(CREATE_SYNC_SECONDARY_INDEXES_SQL);
+      if (this.searchIndexAvailable) {
+        this.clearSearchIndexes();
+        backfillSearchIndexes(this.db);
+      }
     } finally {
       this.searchIndexUpdatesDeferred = false;
     }
@@ -596,8 +664,11 @@ export class CrowdsecDatabase {
     const result = this.insertAlertStatement.run({
       ...dbParams,
       $created_at: index.historyAt,
+      $raw_data: normalizeCrowdsecTimestampJson(params.$raw_data),
       $scenario: index.scenario ?? params.$scenario,
       $source_ip: index.sourceIp ?? params.$source_ip,
+      $latitude: index.latitude,
+      $longitude: index.longitude,
       $country: index.country,
       $country_name: index.countryName,
       $as_name: index.asName,
@@ -675,6 +746,9 @@ export class CrowdsecDatabase {
     const { $record, ...dbParams } = params;
     const result = this.insertDecisionStatement.run({
       ...dbParams,
+      $created_at: normalizeIsoTimestamp(params.$created_at),
+      $stop_at: normalizeIsoTimestamp(params.$stop_at),
+      $raw_data: normalizeCrowdsecTimestampJson(params.$raw_data),
       $country: index.country,
       $country_name: index.countryName,
       $as_name: index.asName,
@@ -710,6 +784,8 @@ export class CrowdsecDatabase {
     const index = deriveDecisionIndexValues(params.$raw_data, fallback);
     this.updateDecisionStatement.run({
       ...params,
+      $stop_at: normalizeIsoTimestamp(params.$stop_at),
+      $raw_data: normalizeCrowdsecTimestampJson(params.$raw_data),
       $country: index.country,
       $country_name: index.countryName,
       $as_name: index.asName,
@@ -833,6 +909,32 @@ export class CrowdsecDatabase {
     return result;
   }
 
+  getDecisionDataBatch(ids: string[]): Map<string, DecisionDataRow> {
+    const result = new Map<string, DecisionDataRow>();
+    if (ids.length === 0) return result;
+
+    const uniqueIds = Array.from(new Set(ids));
+    const chunkSize = 900;
+    for (let offset = 0; offset < uniqueIds.length; offset += chunkSize) {
+      const chunk = uniqueIds.slice(offset, offset + chunkSize);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`
+        SELECT id, raw_data, stop_at, alert_id
+        FROM decisions
+        WHERE id IN (${placeholders})
+      `).all(...chunk) as Array<DecisionDataRow & { id: string | number }>;
+      for (const row of rows) {
+        result.set(String(row.id), {
+          raw_data: row.raw_data,
+          stop_at: row.stop_at,
+          alert_id: row.alert_id,
+        });
+      }
+    }
+
+    return result;
+  }
+
   getActiveDecisionByValue(value: string, now: string): { raw_data: string; stop_at: string } | null {
     return (this.getActiveDecisionByValueStatement.get({ $value: value, $now: now }) as { raw_data: string; stop_at: string } | null) || null;
   }
@@ -848,36 +950,36 @@ export class CrowdsecDatabase {
     if (result.changes > 0) this.decisionDuplicateFlagsDirty = true;
   }
 
-  refreshDecisionDuplicateFlags(now: string, force = false): void {
-    if (!force && !this.decisionDuplicateFlagsDirty) return;
+  refreshDecisionDuplicateFlags(now: string, force = false): number {
+    if (!force && !this.decisionDuplicateFlagsDirty) return 0;
 
-    const refresh = this.db.transaction((timestamp: string) => {
-      this.db.prepare('UPDATE decisions SET is_duplicate = 0 WHERE is_duplicate <> 0').run();
-      this.db.prepare(`
-        WITH ranked AS (
-          SELECT
-            id,
-            ROW_NUMBER() OVER (
-              PARTITION BY COALESCE(value, ''), simulated
-              ORDER BY
-                stop_at DESC,
-                CASE WHEN id GLOB '[0-9]*' THEN CAST(id AS INTEGER) ELSE 9223372036854775807 END ASC
-            ) AS duplicate_rank
-          FROM decisions
-          WHERE stop_at > ?
-        )
-        UPDATE decisions
-        SET is_duplicate = 1
-        WHERE id IN (
-          SELECT id
-          FROM ranked
-          WHERE duplicate_rank > 1
-        )
-      `).run(timestamp);
-    });
-
-    refresh(now);
+    const result = this.db.prepare(`
+      WITH ranked AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (
+            PARTITION BY COALESCE(value, ''), simulated
+            ORDER BY
+              stop_at DESC,
+              CASE WHEN id GLOB '[0-9]*' THEN CAST(id AS INTEGER) ELSE 9223372036854775807 END ASC
+          ) AS duplicate_rank
+        FROM decisions
+        WHERE stop_at > ?
+      ), desired AS (
+        SELECT
+          decisions.id,
+          CASE WHEN ranked.duplicate_rank > 1 THEN 1 ELSE 0 END AS is_duplicate
+        FROM decisions
+        LEFT JOIN ranked ON ranked.id = decisions.id
+      )
+      UPDATE decisions
+      SET is_duplicate = desired.is_duplicate
+      FROM desired
+      WHERE decisions.id = desired.id
+        AND decisions.is_duplicate <> desired.is_duplicate
+    `).run(now);
     this.decisionDuplicateFlagsDirty = false;
+    return result.changes;
   }
 
   getMeta(key: string): MetaRow | null {
@@ -1059,7 +1161,11 @@ export class CrowdsecDatabase {
     $enabled: number;
     $config_json: string;
   }): void {
-    this.upsertNotificationChannelStatement.run(params);
+    this.upsertNotificationChannelStatement.run({
+      ...params,
+      $created_at: normalizeIsoTimestamp(params.$created_at),
+      $updated_at: normalizeIsoTimestamp(params.$updated_at),
+    });
   }
 
   deleteNotificationChannel(id: string): void {
@@ -1085,7 +1191,11 @@ export class CrowdsecDatabase {
     $channel_ids_json: string;
     $config_json: string;
   }): void {
-    this.upsertNotificationRuleStatement.run(params);
+    this.upsertNotificationRuleStatement.run({
+      ...params,
+      $created_at: normalizeIsoTimestamp(params.$created_at),
+      $updated_at: normalizeIsoTimestamp(params.$updated_at),
+    });
   }
 
   deleteNotificationRule(id: string): void {
@@ -1128,7 +1238,14 @@ export class CrowdsecDatabase {
     $deliveries_json: string;
     $dedupe_key: string;
   }): boolean {
-    return this.insertNotificationStatement.run(params).changes > 0;
+    return this.insertNotificationStatement.run({
+      ...params,
+      $created_at: normalizeIsoTimestamp(params.$created_at),
+      $updated_at: normalizeIsoTimestamp(params.$updated_at),
+      $read_at: params.$read_at === null ? null : normalizeIsoTimestamp(params.$read_at),
+      $metadata_json: normalizeTimestampJson(params.$metadata_json),
+      $deliveries_json: normalizeTimestampJson(params.$deliveries_json),
+    }).changes > 0;
   }
 
   listNotificationIncidentsByRule(ruleId: string): JsonRow[] {
@@ -1142,15 +1259,21 @@ export class CrowdsecDatabase {
     $last_seen_at: string;
     $resolved_at: string | null;
   }): void {
-    this.upsertNotificationIncidentStatement.run(params);
+    this.upsertNotificationIncidentStatement.run({
+      ...params,
+      $first_seen_at: normalizeIsoTimestamp(params.$first_seen_at),
+      $last_seen_at: normalizeIsoTimestamp(params.$last_seen_at),
+      $resolved_at: params.$resolved_at === null ? null : normalizeIsoTimestamp(params.$resolved_at),
+    });
   }
 
   resolveNotificationIncident(ruleId: string, incidentKey: string, resolvedAt: string): boolean {
+    const normalizedResolvedAt = normalizeIsoTimestamp(resolvedAt);
     return this.resolveNotificationIncidentStatement.run({
       $rule_id: ruleId,
       $incident_key: incidentKey,
-      $resolved_at: resolvedAt,
-      $last_seen_at: resolvedAt,
+      $resolved_at: normalizedResolvedAt,
+      $last_seen_at: normalizedResolvedAt,
     }).changes > 0;
   }
 
@@ -1167,20 +1290,30 @@ export class CrowdsecDatabase {
   }
 
   markNotificationRead(id: string, readAt: string): boolean {
-    return this.markNotificationReadStatement.run({ $id: id, $read_at: readAt, $updated_at: readAt }).changes > 0;
+    const normalizedReadAt = normalizeIsoTimestamp(readAt);
+    return this.markNotificationReadStatement.run({
+      $id: id,
+      $read_at: normalizedReadAt,
+      $updated_at: normalizedReadAt,
+    }).changes > 0;
   }
 
   markNotificationsRead(ids: string[], readAt: string): number {
+    const normalizedReadAt = normalizeIsoTimestamp(readAt);
     return runChunkedIdMutation(
       this.db,
       'UPDATE notifications SET read_at = ?, updated_at = ? WHERE read_at IS NULL AND id IN',
       ids,
-      [readAt, readAt],
+      [normalizedReadAt, normalizedReadAt],
     );
   }
 
   markAllNotificationsRead(readAt: string): number {
-    return this.markAllNotificationsReadStatement.run({ $read_at: readAt, $updated_at: readAt }).changes;
+    const normalizedReadAt = normalizeIsoTimestamp(readAt);
+    return this.markAllNotificationsReadStatement.run({
+      $read_at: normalizedReadAt,
+      $updated_at: normalizedReadAt,
+    }).changes;
   }
 
   deleteReadNotifications(): number {
@@ -1196,7 +1329,11 @@ export class CrowdsecDatabase {
   }
 
   upsertCveCacheEntry(id: string, publishedAt: string, fetchedAt: string): void {
-    this.upsertCveCacheEntryStatement.run({ $id: id, $published_at: publishedAt, $fetched_at: fetchedAt });
+    this.upsertCveCacheEntryStatement.run({
+      $id: id,
+      $published_at: normalizeIsoTimestamp(publishedAt),
+      $fetched_at: normalizeIsoTimestamp(fetchedAt),
+    });
   }
 
   transaction<T>(callback: (value: T) => void): (value: T) => void {
@@ -1406,6 +1543,8 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
       source_ip TEXT,
       message TEXT,
       raw_data TEXT,
+      latitude REAL,
+      longitude REAL,
       country TEXT,
       country_name TEXT,
       as_name TEXT,
@@ -1416,7 +1555,6 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
       simulated INTEGER NOT NULL DEFAULT 0,
       search_text TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
   `;
 
   const createDecisionsTable = `
@@ -1440,15 +1578,6 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
       search_text TEXT,
       is_duplicate INTEGER NOT NULL DEFAULT 0
     );
-  `;
-
-  const createDecisionIndexes = `
-    CREATE INDEX IF NOT EXISTS idx_decisions_stop_at ON decisions(stop_at);
-    CREATE INDEX IF NOT EXISTS idx_decisions_alert_id ON decisions(alert_id);
-    CREATE INDEX IF NOT EXISTS idx_decisions_value ON decisions(value);
-    CREATE INDEX IF NOT EXISTS idx_decisions_created_at ON decisions(created_at);
-    CREATE INDEX IF NOT EXISTS idx_decisions_stop_alert_id ON decisions(stop_at, alert_id);
-    CREATE INDEX IF NOT EXISTS idx_decisions_value_stop_at ON decisions(value, stop_at DESC);
   `;
 
   const createMetaTable = `
@@ -1596,8 +1725,8 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
             $id: String(decision.id),
             $uuid: decision.uuid,
             $alert_id: decision.alert_id,
-            $created_at: decision.created_at,
-            $stop_at: decision.stop_at,
+            $created_at: normalizeIsoTimestamp(String(decision.created_at)),
+            $stop_at: normalizeIsoTimestamp(String(decision.stop_at)),
             $value: decision.value,
             $type: decision.type,
             $origin: decision.origin,
@@ -1613,7 +1742,7 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
     db.exec(createDecisionsTable);
   }
 
-  db.exec(createDecisionIndexes);
+  migrateTimestamps(db);
   migrateRecordIndexColumns(db);
   migrateNotificationRulesTable(db, createNotificationRulesTable);
   migrateNotificationsTable(db, createNotificationsTable);
@@ -1627,8 +1756,79 @@ function initSchema(db: Database, freshDatabase: boolean): boolean {
   return searchIndexAvailable;
 }
 
+const TIMESTAMP_MIGRATIONS = [
+  { table: 'alerts', timestampColumns: ['created_at'], jsonColumns: ['raw_data'] },
+  { table: 'decisions', timestampColumns: ['created_at', 'stop_at'], jsonColumns: ['raw_data'] },
+  { table: 'auth_users', timestampColumns: ['created_at', 'updated_at'] },
+  { table: 'webauthn_credentials', timestampColumns: ['created_at'] },
+  { table: 'notification_channels', timestampColumns: ['created_at', 'updated_at'] },
+  { table: 'notification_rules', timestampColumns: ['created_at', 'updated_at'] },
+  {
+    table: 'notifications',
+    timestampColumns: ['created_at', 'updated_at', 'read_at'],
+    jsonColumns: ['metadata_json', 'deliveries_json'],
+  },
+  {
+    table: 'notification_incidents',
+    timestampColumns: ['first_seen_at', 'last_seen_at', 'resolved_at'],
+  },
+  { table: 'cve_cache', timestampColumns: ['published_at', 'fetched_at'] },
+] as const;
+
+function migrateTimestamps(db: Database): void {
+  const migrationKey = 'sync_timestamp_format_version';
+  const currentVersion = db.query('SELECT value FROM meta WHERE key = ?').get(migrationKey) as MetaRow | null;
+  if (currentVersion?.value === '2') return;
+
+  const migrate = db.transaction(() => {
+    for (const migration of TIMESTAMP_MIGRATIONS) {
+      const timestampColumns = [...migration.timestampColumns];
+      const jsonColumns = 'jsonColumns' in migration ? [...migration.jsonColumns] : [];
+      const columns = [...timestampColumns, ...jsonColumns];
+      const rows = db.query(`
+        SELECT rowid AS migration_rowid, ${columns.join(', ')}
+        FROM ${migration.table}
+      `).all() as Array<Record<string, unknown>>;
+      const update = db.query(`
+        UPDATE ${migration.table}
+        SET ${columns.map((column) => `${column} = $${column}`).join(', ')}
+        WHERE rowid = $migration_rowid
+      `);
+
+      for (const row of rows) {
+        let changed = false;
+        const params: Record<string, unknown> = { $migration_rowid: row.migration_rowid };
+        for (const column of timestampColumns) {
+          const original = row[column];
+          const normalized = typeof original === 'string' ? normalizeIsoTimestamp(original) : original;
+          params[`$${column}`] = normalized;
+          changed ||= normalized !== original;
+        }
+        for (const column of jsonColumns) {
+          const original = row[column];
+          const normalized = typeof original === 'string' ? normalizeTimestampJson(original) : original;
+          params[`$${column}`] = normalized;
+          changed ||= normalized !== original;
+        }
+        if (changed) {
+          update.run(params);
+        }
+      }
+    }
+    db.query('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(migrationKey, '2');
+  });
+  migrate();
+}
+
 function migrateRecordIndexColumns(db: Database): void {
+  const existingAlertColumns = new Set(
+    (db.query('PRAGMA table_info(alerts)').all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  const shouldBackfillAlertLocations = !existingAlertColumns.has('latitude') || !existingAlertColumns.has('longitude');
+
   ensureColumns(db, 'alerts', [
+    ['latitude', 'REAL'],
+    ['longitude', 'REAL'],
     ['country', 'TEXT'],
     ['country_name', 'TEXT'],
     ['as_name', 'TEXT'],
@@ -1650,30 +1850,34 @@ function migrateRecordIndexColumns(db: Database): void {
     ['is_duplicate', 'INTEGER NOT NULL DEFAULT 0'],
   ]);
 
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_alerts_country ON alerts(country);
-    CREATE INDEX IF NOT EXISTS idx_alerts_scenario ON alerts(scenario);
-    CREATE INDEX IF NOT EXISTS idx_alerts_as_name ON alerts(as_name);
-    CREATE INDEX IF NOT EXISTS idx_alerts_target ON alerts(target);
-    CREATE INDEX IF NOT EXISTS idx_alerts_source_ip ON alerts(source_ip);
-    CREATE INDEX IF NOT EXISTS idx_alerts_simulated ON alerts(simulated);
-    CREATE INDEX IF NOT EXISTS idx_alerts_simulated_created_at ON alerts(simulated, created_at DESC, id DESC);
-    CREATE INDEX IF NOT EXISTS idx_alerts_country_created_at ON alerts(country, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_alerts_scenario_created_at ON alerts(scenario, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_decisions_country ON decisions(country);
-    CREATE INDEX IF NOT EXISTS idx_decisions_scenario ON decisions(scenario);
-    CREATE INDEX IF NOT EXISTS idx_decisions_as_name ON decisions(as_name);
-    CREATE INDEX IF NOT EXISTS idx_decisions_target ON decisions(target);
-    CREATE INDEX IF NOT EXISTS idx_decisions_simulated ON decisions(simulated);
-    CREATE INDEX IF NOT EXISTS idx_decisions_simulated_created_at ON decisions(simulated, created_at DESC, id DESC);
-    CREATE INDEX IF NOT EXISTS idx_decisions_alert_created_at ON decisions(alert_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_decisions_stop_alert_id ON decisions(stop_at, alert_id);
-    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_active ON decisions(is_duplicate, stop_at, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_created_at ON decisions(is_duplicate, created_at DESC, id DESC);
-    CREATE INDEX IF NOT EXISTS idx_decisions_duplicate_primary ON decisions(value, simulated, stop_at DESC, id);
-  `);
+  if (shouldBackfillAlertLocations) {
+    backfillAlertLocationColumns(db);
+  }
+
+  // Replaced by idx_decisions_alert_created_id, which also satisfies the
+  // deterministic decision paging order and covers the history predicate.
+  db.exec('DROP INDEX IF EXISTS idx_decisions_alert_created_at');
+  db.exec(CREATE_SYNC_SECONDARY_INDEXES_SQL);
 
   backfillRecordIndexes(db);
+}
+
+function backfillAlertLocationColumns(db: Database): void {
+  db.exec(`
+    UPDATE alerts
+    SET latitude = CASE
+          WHEN json_valid(raw_data)
+            AND CAST(json_extract(raw_data, '$.source.latitude') AS REAL) BETWEEN -90 AND 90
+          THEN CAST(json_extract(raw_data, '$.source.latitude') AS REAL)
+          ELSE NULL
+        END,
+        longitude = CASE
+          WHEN json_valid(raw_data)
+            AND CAST(json_extract(raw_data, '$.source.longitude') AS REAL) BETWEEN -180 AND 180
+          THEN CAST(json_extract(raw_data, '$.source.longitude') AS REAL)
+          ELSE NULL
+        END
+  `);
 }
 
 function ensureColumns(db: Database, tableName: string, columns: Array<[string, string]>): void {
@@ -1697,6 +1901,8 @@ function backfillRecordIndexes(db: Database): void {
     SET created_at = $created_at,
         scenario = $scenario,
         source_ip = $source_ip,
+        latitude = $latitude,
+        longitude = $longitude,
         country = $country,
         country_name = $country_name,
         as_name = $as_name,
@@ -1733,6 +1939,8 @@ function backfillRecordIndexes(db: Database): void {
           $created_at: index.historyAt,
           $scenario: index.scenario ?? row.scenario,
           $source_ip: index.sourceIp ?? row.source_ip,
+          $latitude: index.latitude,
+          $longitude: index.longitude,
           $country: index.country,
           $country_name: index.countryName,
           $as_name: index.asName,
@@ -1961,8 +2169,8 @@ function migrateNotificationRulesTable(db: Database, createNotificationRulesTabl
     for (const rule of rules) {
       (insertStatement as any).run({
         $id: String(rule.id),
-        $created_at: String(rule.created_at),
-        $updated_at: String(rule.updated_at),
+        $created_at: normalizeIsoTimestamp(String(rule.created_at)),
+        $updated_at: normalizeIsoTimestamp(String(rule.updated_at)),
         $name: String(rule.name),
         $type: String(rule.type),
         $enabled: Number(rule.enabled) === 1 ? 1 : 0,
@@ -2016,17 +2224,17 @@ function migrateNotificationsTable(db: Database, createNotificationsTable: strin
     for (const notification of notifications) {
       (insertStatement as any).run({
         $id: String(notification.id),
-        $created_at: String(notification.created_at),
-        $updated_at: String(notification.updated_at),
+        $created_at: normalizeIsoTimestamp(String(notification.created_at)),
+        $updated_at: normalizeIsoTimestamp(String(notification.updated_at)),
         $rule_id: String(notification.rule_id),
         $rule_name: String(notification.rule_name),
         $rule_type: String(notification.rule_type),
         $severity: String(notification.severity),
         $title: String(notification.title),
         $message: String(notification.message),
-        $read_at: notification.read_at == null ? null : String(notification.read_at),
-        $metadata_json: String(notification.metadata_json || '{}'),
-        $deliveries_json: String(notification.deliveries_json || '[]'),
+        $read_at: notification.read_at == null ? null : normalizeIsoTimestamp(String(notification.read_at)),
+        $metadata_json: normalizeTimestampJson(String(notification.metadata_json || '{}')),
+        $deliveries_json: normalizeTimestampJson(String(notification.deliveries_json || '[]')),
         $dedupe_key: String(notification.dedupe_key || ''),
       });
     }
@@ -2056,7 +2264,7 @@ function seedNotificationIncidentsFromHistoryIfEmpty(db: Database): void {
     const ruleId = String(row.rule_id || '');
     const ruleType = String(row.rule_type || '');
     const incidentKey = normalizeIncidentKeyForSeed(ruleId, ruleType, String(row.dedupe_key || ''));
-    const createdAt = String(row.created_at || '');
+    const createdAt = normalizeIsoTimestamp(String(row.created_at || ''));
     if (!ruleId || !incidentKey || !createdAt) {
       continue;
     }

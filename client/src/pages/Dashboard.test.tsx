@@ -81,6 +81,15 @@ function buildDashboardStatsResponse(filters?: Record<string, string>) {
         simulatedCount: simulatedAlertCount,
       },
     ],
+    attackLocations: [
+      {
+        latitude: 52.52,
+        longitude: 13.405,
+        count: allAlertCount,
+        liveCount: liveAlertCount,
+        simulatedCount: simulatedAlertCount,
+      },
+    ],
     topScenarios: liveAlertCount ? [{ label: 'crowdsecurity/ssh-bf', count: liveAlertCount }] : [],
     topAS: liveAlertCount ? [{ label: 'Hetzner', count: liveAlertCount }] : [],
     series: {
@@ -183,9 +192,11 @@ describe('Dashboard page', () => {
 
     const mapProps = mapSpy.mock.calls.at(-1)?.[0] as {
       simulationsEnabled?: boolean;
+      attackLocations?: Array<{ latitude: number; longitude: number; count: number }>;
       data?: Array<{ simulatedCount?: number }>;
     };
     expect(mapProps.simulationsEnabled).toBe(true);
+    expect(mapProps.attackLocations).toEqual([expect.objectContaining({ latitude: 52.52, longitude: 13.405, count: 2 })]);
     expect(mapProps.data?.some((item) => item.simulatedCount === 1)).toBe(true);
   });
 
@@ -303,6 +314,7 @@ describe('Dashboard page', () => {
       topTargets: [],
       topCountries: [],
       allCountries: [],
+      attackLocations: [],
       topScenarios: [],
       topAS: [],
     });
@@ -345,6 +357,7 @@ describe('Dashboard page', () => {
       topTargets: [],
       topCountries: [],
       allCountries: [],
+      attackLocations: [],
       topScenarios: [],
       topAS: [],
     }));
@@ -520,6 +533,16 @@ describe('Dashboard page', () => {
     expect(screen.queryByText('Loading statistics...')).not.toBeInTheDocument();
     expect(screen.getByText('Refreshing dashboard...')).toBeInTheDocument();
 
+    const chartControls = screen.getByText('Chart').closest('[aria-disabled="true"]');
+    const statisticControls = screen.getByText('Top Countries').closest('[aria-disabled="true"]');
+    expect(chartControls).not.toBeNull();
+    expect(chartControls).not.toHaveClass('opacity-70');
+    expect(chartControls).not.toHaveClass('transition-opacity');
+    expect(statisticControls).not.toBeNull();
+    expect(statisticControls).not.toHaveClass('opacity-70');
+    expect(statisticControls).not.toHaveClass('transition-opacity');
+    expect(screen.getByRole('button', { name: 'Live' })).not.toHaveClass('disabled:opacity-60');
+
     deferred.resolve(buildDashboardStatsResponse({ simulation: 'live' }));
 
     await waitFor(() => {
@@ -529,7 +552,16 @@ describe('Dashboard page', () => {
     });
   });
 
-  test('ignores an older dashboard request that resolves after a filter change', async () => {
+  test('prevents another filter change until the current filter has been applied', async () => {
+    const pendingLiveStats = createDeferred<ReturnType<typeof buildDashboardStatsResponse>>();
+    fetchDashboardStatsMock.mockImplementation((filters?: Record<string, string>) => {
+      if (filters?.simulation === 'live') {
+        return pendingLiveStats.promise;
+      }
+
+      return Promise.resolve(buildDashboardStatsResponse(filters));
+    });
+
     render(
       <MemoryRouter>
         <Dashboard />
@@ -537,21 +569,6 @@ describe('Dashboard page', () => {
     );
 
     await waitFor(() => expect(screen.getByText('Total Alerts')).toBeInTheDocument());
-
-    const staleLiveRefresh = createDeferred<ReturnType<typeof buildDashboardStatsResponse>>();
-    fetchDashboardStatsMock.mockImplementation((filters?: Record<string, string>) => {
-      if (filters?.simulation === 'live') {
-        return staleLiveRefresh.promise;
-      }
-      if (filters?.simulation === 'simulated') {
-        return Promise.resolve({
-          ...buildDashboardStatsResponse(filters),
-          topScenarios: [{ label: 'crowdsecurity/simulated-only', count: 1 }],
-        });
-      }
-
-      return Promise.resolve(buildDashboardStatsResponse(filters));
-    });
     fetchDashboardStatsMock.mockClear();
 
     await userEvent.click(screen.getByRole('button', { name: 'Live' }));
@@ -560,27 +577,25 @@ describe('Dashboard page', () => {
       expect.any(Object),
     ));
 
+    expect(screen.getByRole('button', { name: 'All' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Live' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Simulation' })).toBeDisabled();
+
     await userEvent.click(screen.getByRole('button', { name: 'Simulation' }));
+    expect(fetchDashboardStatsMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ simulation: 'simulated' }),
+      expect.any(Object),
+    );
+
+    pendingLiveStats.resolve(buildDashboardStatsResponse({ simulation: 'live' }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Simulation' })).toBeEnabled());
+    await userEvent.click(screen.getByRole('button', { name: 'Simulation' }));
+
     await waitFor(() => expect(fetchDashboardStatsMock).toHaveBeenCalledWith(
       expect.objectContaining({ simulation: 'simulated' }),
       expect.any(Object),
     ));
-    await screen.findByText('simulated-only');
-
-    staleLiveRefresh.resolve({
-      ...buildDashboardStatsResponse({ simulation: 'live' }),
-      topScenarios: [
-        { label: 'crowdsecurity/ssh-bf', count: 1 },
-        { label: 'crowdsecurity/stale-scenario', count: 99 },
-      ],
-    });
-
-    await waitFor(() => {
-      const alertsCard = screen.getByText('Total Alerts').closest('a');
-      expect(alertsCard).not.toBeNull();
-      expect(within(alertsCard as HTMLElement).getByRole('heading', { level: 3 })).toHaveTextContent('1');
-      expect(screen.queryByText('stale-scenario')).not.toBeInTheDocument();
-    });
   });
 
   test('retries the initial dashboard load after a strict mode abort cleanup', async () => {
