@@ -163,6 +163,7 @@ export interface SearchIndexRebuildScope {
 export interface DatabaseOptions {
   dbDir?: string;
   dbPath?: string;
+  walEnabled?: boolean;
 }
 
 type RowWithRawData = { raw_data: string; created_at?: string; stop_at?: string; alert_id?: string | number | null };
@@ -336,7 +337,7 @@ export class CrowdsecDatabase {
   constructor(options: DatabaseOptions = {}) {
     const resolvedPath = resolveDatabasePath(options);
     this.dbPath = resolvedPath;
-    this.db = openDatabase(resolvedPath);
+    this.db = openDatabase(resolvedPath, options.walEnabled ?? true);
     const freshDatabase = isDatabaseFresh(this.db);
     this.searchIndexAvailable = initSchema(this.db, freshDatabase);
     this.loadDecisionDuplicateRefreshState();
@@ -571,7 +572,7 @@ export class CrowdsecDatabase {
     this.getDecisionIdsByAlertIdStatement = this.db.query('SELECT id FROM decisions WHERE alert_id = $alert_id');
     this.getActiveDecisionByValueStatement = this.db.query(`
       SELECT ${DECISION_RECORD_COLUMNS} FROM decisions
-      WHERE value = $value AND stop_at > $now AND id NOT LIKE 'dup_%'
+      WHERE value = $value AND stop_at > $now AND id NOT LIKE 'dup\\_%' ESCAPE '\\'
       ORDER BY stop_at DESC
       LIMIT 1
     `);
@@ -2186,24 +2187,27 @@ function ensureDirectory(dirPath: string): void {
   }
 }
 
-function openDatabase(dbPath: string): Database {
+function openDatabase(dbPath: string, walEnabled: boolean): Database {
   try {
-    const database = createDatabase(dbPath);
-    database.exec('PRAGMA journal_mode = WAL');
-    database.exec('PRAGMA foreign_keys = ON');
-    database.exec('PRAGMA synchronous = NORMAL');
-    database.exec('PRAGMA cache_size = -32000');
-    database.exec('PRAGMA temp_store = MEMORY');
-    database.exec('PRAGMA busy_timeout = 5000');
-    database.exec('PRAGMA mmap_size = 268435456');
-    registerDatabaseFunctions(database);
-    return database;
+    return configureDatabase(createDatabase(dbPath), walEnabled);
   } catch (error: any) {
     if (dbPath.startsWith('/app/data') && error?.code === 'EACCES') {
-      return createDatabase('crowdsec.db');
+      return configureDatabase(createDatabase('crowdsec.db'), walEnabled);
     }
     throw error;
   }
+}
+
+function configureDatabase(database: Database, walEnabled: boolean): Database {
+  database.exec(`PRAGMA journal_mode = ${walEnabled ? 'WAL' : 'DELETE'}`);
+  database.exec('PRAGMA foreign_keys = ON');
+  database.exec('PRAGMA synchronous = NORMAL');
+  database.exec('PRAGMA cache_size = -32000');
+  database.exec('PRAGMA temp_store = MEMORY');
+  database.exec('PRAGMA busy_timeout = 5000');
+  database.exec('PRAGMA mmap_size = 268435456');
+  registerDatabaseFunctions(database);
+  return database;
 }
 
 function registerDatabaseFunctions(database: Database): void {
@@ -2221,7 +2225,7 @@ function isDatabaseFresh(db: Database): boolean {
     SELECT COUNT(*) AS count
     FROM sqlite_master
     WHERE type = 'table'
-      AND name NOT LIKE 'sqlite_%'
+      AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
   `).get() as CountRow;
   return row.count === 0;
 }
@@ -3061,16 +3065,17 @@ function backfillRecordIndexes(db: Database): void {
 
 function initSearchIndexes(db: Database): boolean {
   try {
+    dropLegacySearchIndexes(db);
     db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS alerts_fts USING fts5(
         alert_id UNINDEXED,
         search_text,
-        tokenize = 'unicode61'
+        tokenize = 'trigram'
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
         decision_id UNINDEXED,
         search_text,
-        tokenize = 'unicode61'
+        tokenize = 'trigram'
       );
       CREATE TABLE IF NOT EXISTS decision_fts_rows (
         decision_id TEXT PRIMARY KEY,
@@ -3083,6 +3088,23 @@ function initSearchIndexes(db: Database): boolean {
     console.warn('SQLite FTS5 is unavailable; falling back to LIKE search.', (error as Error).message);
     return false;
   }
+}
+
+function dropLegacySearchIndexes(db: Database): void {
+  const definitions = db.query(`
+    SELECT name, sql
+    FROM sqlite_master
+    WHERE type = 'table' AND name IN ('alerts_fts', 'decisions_fts')
+  `).all() as Array<{ name: string; sql?: string | null }>;
+  if (definitions.length === 0 || definitions.every((definition) => /tokenize\s*=\s*['"]trigram['"]/i.test(definition.sql || ''))) {
+    return;
+  }
+
+  db.exec(`
+    DROP TABLE IF EXISTS alerts_fts;
+    DROP TABLE IF EXISTS decisions_fts;
+    DROP TABLE IF EXISTS decision_fts_rows;
+  `);
 }
 
 function backfillSearchIndexes(db: Database): void {

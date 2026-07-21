@@ -2,12 +2,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createCrowdsecAuthConfig, type CrowdsecAuthConfig } from './auth';
 import {
+  type AppliedConfigEnvironmentOverride,
   DEPRECATED_CONFIG_ENV,
+  applyConfigSetupEnvironment,
   generateApplicationConfig,
+  hasConfigEnvironmentOverrides,
   loadApplicationConfig,
+  mergeApplicationConfigEnvironment,
+  parseApplicationConfig,
+  persistApplicationConfig,
   saveApplicationConfig,
   type ParsedConfigFile,
 } from './config-file';
+import { ConfigurationEnvironmentError, ConfigurationLoadError, isConfigurationError } from './config-error';
 import { resolveSecretEnv } from './env-secrets';
 import { hasLegacyConnectionEnvironment, loadInstancesConfig, type CrowdsecInstanceConfig } from './instances-config';
 
@@ -79,6 +86,7 @@ export interface RuntimeConfig {
   loadTestProfile: string | null;
   dbDir: string;
   geonamesDumpDir: string;
+  sqliteWalEnabled: boolean;
   notificationSecretKey?: string;
   notificationAllowPrivateAddresses: boolean;
   notificationDebugPayloads: boolean;
@@ -412,6 +420,7 @@ function createRuntimeConfigFromEnvironment(env: NodeJS.ProcessEnv): RuntimeConf
       : null,
     dbDir: env.DB_DIR || '/app/data',
     geonamesDumpDir: env.GEONAMES_DUMP_DIR || path.resolve(process.cwd(), 'geonames'),
+    sqliteWalEnabled: true,
     notificationSecretKey,
     notificationAllowPrivateAddresses: parseBooleanEnv(env.NOTIFICATION_ALLOW_PRIVATE_ADDRESSES, true),
     notificationDebugPayloads: parseBooleanEnv(env.NOTIFICATION_DEBUG_PAYLOADS, false),
@@ -479,6 +488,7 @@ function warnDeprecatedEnvironment(
 function createRuntimeConfigFromParsedConfig(parsed: ParsedConfigFile): RuntimeConfig {
   const runtimeConfig = createRuntimeConfigFromEnvironment(parsed.environment);
   runtimeConfig.instances = parsed.instances;
+  runtimeConfig.sqliteWalEnabled = parsed.sqliteWalEnabled;
   const primaryInstance = parsed.instances[0];
   runtimeConfig.crowdsecUrl = primaryInstance.lapiUrl;
   runtimeConfig.crowdsecAuth = primaryInstance.lapiAuth.mode === 'mtls'
@@ -497,6 +507,74 @@ export interface RuntimeConfigOptions {
   defaultConfigFile?: string;
 }
 
+const CONFIG_CONTROL_ENV = new Set(['CONFIG_FILE', 'CONFIG_PERSIST_OVERRIDES']);
+
+function persistConfigEnvironmentOverrides(env: NodeJS.ProcessEnv): boolean {
+  const name = 'CONFIG_PERSIST_OVERRIDES';
+  const value = env[name];
+  if (value === undefined) return false;
+  const enabled = parseOptionalBooleanEnv(value);
+  if (enabled === null) {
+    throw new ConfigurationEnvironmentError(
+      `${name} must be a boolean (true/false, yes/no, on/off, or 1/0).`,
+      [name],
+    );
+  }
+  return enabled;
+}
+
+const SECRET_CONFIG_KEYS = new Set([
+  'clientSecret',
+  'password',
+  'secretKey',
+  'sessionSecret',
+  'token',
+  'totpSecret',
+  'totpSeed',
+]);
+
+function redactConfigLogValue(value: unknown, path: readonly (string | number)[] = []): unknown {
+  const key = path.at(-1);
+  if (typeof key === 'string' && SECRET_CONFIG_KEYS.has(key)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const reference = value as Record<string, unknown>;
+      if (typeof reference.env === 'string') return `[redacted; env: ${reference.env}]`;
+      if (typeof reference.file === 'string') return `[redacted; file: ${reference.file}]`;
+    }
+    return value === undefined ? undefined : '[redacted]';
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => redactConfigLogValue(item, [...path, index]));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => (
+      [entryKey, redactConfigLogValue(entryValue, [...path, entryKey])]
+    )));
+  }
+  return value;
+}
+
+function formatConfigPath(path: readonly (string | number)[]): string {
+  return path.map((part, index) => (
+    typeof part === 'number' ? `[${part}]` : `${index === 0 ? '' : '.'}${part}`
+  )).join('');
+}
+
+function formatConfigLogValue(value: unknown, path: readonly (string | number)[]): string {
+  if (value === undefined) return '<unset>';
+  const redacted = redactConfigLogValue(value, path);
+  return JSON.stringify(redacted) ?? String(redacted);
+}
+
+function logConfigEnvironmentOverrides(overrides: readonly AppliedConfigEnvironmentOverride[]): void {
+  for (const override of overrides) {
+    const configPath = formatConfigPath(override.path);
+    const previousValue = formatConfigLogValue(override.previousValue, override.path);
+    const value = formatConfigLogValue(override.value, override.path);
+    console.log(`  ${override.name} -> ${configPath}: ${previousValue} -> ${value}`);
+  }
+}
+
 function defaultApplicationConfigFile(): string {
   const dockerDataDir = '/app/data';
   const dataDir = fs.existsSync(dockerDataDir) ? dockerDataDir : path.resolve(process.cwd(), 'data');
@@ -511,16 +589,58 @@ export function createRuntimeConfig(
   const defaultConfigFile = options.defaultConfigFile || defaultApplicationConfigFile();
   const configFile = explicitConfigFile || defaultConfigFile;
   let migrated = false;
+  let parsedConfig: ParsedConfigFile | undefined;
+  let appliedOverrides: AppliedConfigEnvironmentOverride[] = [];
 
-  if (!explicitConfigFile && !fs.existsSync(configFile)) {
-    const legacyConfig = createRuntimeConfigFromEnvironment(env);
-    const generatedConfig = generateApplicationConfig(env, legacyConfig);
-    migrated = saveApplicationConfig(configFile, generatedConfig);
-    if (migrated) console.log(`Saved generated legacy configuration to ${configFile}.`);
+  try {
+    const persistEnvironmentOverrides = persistConfigEnvironmentOverrides(env);
+
+    if (!explicitConfigFile && !fs.existsSync(configFile)) {
+      const legacyConfig = createRuntimeConfigFromEnvironment(env);
+      const generatedConfig = applyConfigSetupEnvironment(
+        generateApplicationConfig(env, legacyConfig),
+        env,
+        appliedOverrides,
+      );
+      parseApplicationConfig(generatedConfig, env);
+      migrated = saveApplicationConfig(configFile, generatedConfig, env);
+      if (migrated) {
+        console.log(`Saved generated configuration to ${configFile}.`);
+        if (appliedOverrides.length > 0) {
+          console.log('Applied CONFIG_ values while generating the application configuration.');
+          logConfigEnvironmentOverrides(appliedOverrides);
+        }
+      }
+    }
+
+    if (!migrated && fs.existsSync(configFile) && hasConfigEnvironmentOverrides(env)) {
+      const mergedConfig = mergeApplicationConfigEnvironment(configFile, env);
+      appliedOverrides = mergedConfig.overrides;
+      parsedConfig = parseApplicationConfig(mergedConfig.document, env);
+      if (persistEnvironmentOverrides) {
+        persistApplicationConfig(configFile, mergedConfig.yaml);
+        console.log(`Applied CONFIG_ overrides and persisted application configuration to ${configFile}.`);
+      } else {
+        console.log(`Applied CONFIG_ overrides to application configuration from ${configFile}.`);
+      }
+      logConfigEnvironmentOverrides(appliedOverrides);
+    }
+
+    warnDeprecatedEnvironment(env, { configFile, migrated });
+    const runtimeConfig = createRuntimeConfigFromParsedConfig(parsedConfig || loadApplicationConfig(configFile, env));
+    console.log(`Loaded application configuration from ${configFile}.`);
+    return runtimeConfig;
+  } catch (error) {
+    if (error instanceof ConfigurationLoadError) throw error;
+    if (!isConfigurationError(error)) throw error;
+    const configuredOverrideNames = Object.keys(env).filter((name) => (
+      name.startsWith('CONFIG_') && !CONFIG_CONTROL_ENV.has(name)
+    ));
+    const isEnvironmentError = error instanceof ConfigurationEnvironmentError;
+    throw new ConfigurationLoadError(error, {
+      configFile,
+      overrides: isEnvironmentError ? undefined : appliedOverrides,
+      overrideNames: isEnvironmentError ? error.overrideNames : configuredOverrideNames,
+    });
   }
-
-  warnDeprecatedEnvironment(env, { configFile, migrated });
-  const runtimeConfig = createRuntimeConfigFromParsedConfig(loadApplicationConfig(configFile, env));
-  console.log(`Loaded application configuration from ${configFile}.`);
-  return runtimeConfig;
 }

@@ -1098,7 +1098,7 @@ test('dashboard auth enforces an environment-configured TOTP seed for the passwo
   }));
   expect(disableTotp.status).toBe(400);
   expect(await disableTotp.json()).toMatchObject({
-    error: 'TOTP is configured by AUTH_TOTP_SEED and cannot be disabled from Settings',
+    error: 'TOTP is managed by the application configuration and cannot be disabled from Settings',
   });
 });
 
@@ -2737,6 +2737,129 @@ describe('createApp', () => {
     expect((await decisionsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
       expect.objectContaining({
         data: [expect.objectContaining({ id: 11 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    controller.stopBackgroundTasks();
+    database.close();
+    destroyTempDir();
+  });
+
+  test('treats underscores literally in scenario searches', async () => {
+    const matchingAlert = sampleAlert({
+      id: 1,
+      uuid: 'alert-1',
+      scenario: 'crowdsecurity/netgear_rce',
+      source: { ip: '1.2.3.4', value: '1.2.3.4' },
+      decisions: [{
+        id: 10,
+        value: '1.2.3.4',
+        stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(),
+        type: 'ban',
+        origin: 'crowdsec',
+        scenario: 'crowdsecurity/netgear_rce',
+        simulated: false,
+      }],
+    });
+    const wildcardLookalike = sampleAlert({
+      id: 2,
+      uuid: 'alert-2',
+      scenario: 'crowdsecurity/netgearXrce',
+      source: { ip: '5.6.7.8', value: '5.6.7.8' },
+      decisions: [{
+        id: 20,
+        value: '5.6.7.8',
+        stop_at: new Date(Date.now() + 30 * 60 * 1_000).toISOString(),
+        type: 'ban',
+        origin: 'crowdsec',
+        scenario: 'crowdsecurity/netgearXrce',
+        simulated: false,
+      }],
+    });
+    const { controller, database } = createController({
+      fetchResolver: (url) => url.includes('/v1/alerts?')
+        ? Response.json([matchingAlert, wildcardLookalike])
+        : undefined,
+    });
+    seedAlert(database, matchingAlert);
+    seedAlert(database, wildcardLookalike);
+
+    const query = encodeURIComponent('scenario:crowdsecurity/netgear_rce');
+    const alertsResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=${query}`,
+    ));
+    expect(alertsResponse.status).toBe(200);
+    expect((await alertsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const decisionsResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=${query}`,
+    ));
+    expect(decisionsResponse.status).toBe(200);
+    expect((await decisionsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 10 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const exactQuery = encodeURIComponent('scenario=crowdsecurity/netgear_rce');
+    const exactAlertsResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=${exactQuery}`,
+    ));
+    expect(exactAlertsResponse.status).toBe(200);
+    expect((await exactAlertsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const exactDecisionsResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/decisions?page=1&page_size=10&q=${exactQuery}`,
+    ));
+    expect(exactDecisionsResponse.status).toBe(200);
+    expect((await exactDecisionsResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 10 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const exactPrefixQuery = encodeURIComponent('scenario=crowdsecurity/netgear');
+    const exactPrefixResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=${exactPrefixQuery}`,
+    ));
+    expect(exactPrefixResponse.status).toBe(200);
+    expect((await exactPrefixResponse.json()) as { data: unknown[]; pagination: { total: number } }).toEqual(
+      expect.objectContaining({ data: [], pagination: expect.objectContaining({ total: 0 }) }),
+    );
+
+    const notExactQuery = encodeURIComponent('scenario<>crowdsecurity/netgear_rce');
+    const notExactResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=${notExactQuery}`,
+    ));
+    expect(notExactResponse.status).toBe(200);
+    expect((await notExactResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 2 })],
+        pagination: expect.objectContaining({ total: 1 }),
+      }),
+    );
+
+    const substringQuery = encodeURIComponent('gear_r');
+    const substringResponse = await controller.fetch(new Request(
+      `http://localhost/crowdsec/api/alerts?page=1&page_size=10&q=${substringQuery}`,
+    ));
+    expect(substringResponse.status).toBe(200);
+    expect((await substringResponse.json()) as { data: Array<{ id: number }>; pagination: { total: number } }).toEqual(
+      expect.objectContaining({
+        data: [expect.objectContaining({ id: 1 })],
         pagination: expect.objectContaining({ total: 1 }),
       }),
     );
@@ -4487,7 +4610,7 @@ describe('createApp', () => {
       runExclusive: vi.fn(async (operation) => operation()),
       close: vi.fn(),
     };
-    const { controller, database, lapiClient } = createController({
+    const { controller, database, lapiClient, fetchCalls } = createController({
       env: {
         CROWDSEC_REFRESH_INTERVAL: '30s',
         CROWDSEC_HEARTBEAT_INTERVAL: 'manual',
@@ -4502,11 +4625,12 @@ describe('createApp', () => {
       controller.startBackgroundTasks();
       await vi.advanceTimersByTimeAsync(0);
       await dashboardStarted;
+      const alertRequestsBeforeScheduler = fetchCalls.filter(({ url }) => url.includes('/v1/alerts?')).length;
       await vi.advanceTimersByTimeAsync(30_001);
 
       const logs = logSpy.mock.calls.map((call) => String(call[0]));
       expect(logs).toContain('Background refresh paused until bootstrap recovery completes.');
-      expect(logs).not.toContain('Background refresh triggered (ACTIVE)...');
+      expect(fetchCalls.filter(({ url }) => url.includes('/v1/alerts?'))).toHaveLength(alertRequestsBeforeScheduler);
 
       dashboardReleased = true;
       releaseDashboard();

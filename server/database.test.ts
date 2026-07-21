@@ -265,6 +265,7 @@ describe('CrowdsecDatabase', () => {
     expect(db.countAlerts()).toBe(1);
     expect(db.searchIndexAvailable).toBe(true);
     expect((db.db.prepare('SELECT COUNT(*) AS count FROM alerts_fts WHERE alerts_fts MATCH ?').get('alert') as { count: number }).count).toBe(1);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM alerts_fts WHERE alerts_fts MATCH ?').get('ler') as { count: number }).count).toBe(1);
     expect(db.getAlertsSince('2024-12-31T00:00:00.000Z')).toHaveLength(1);
     expect(db.getActiveDecisions('2025-01-01T00:00:00.000Z')).toHaveLength(1);
     expect(db.getDecisionById('10')?.stop_at).toBe('2030-01-01T00:00:00.000Z');
@@ -291,6 +292,28 @@ describe('CrowdsecDatabase', () => {
     expect(db.getActiveDecisions('2025-01-01T00:00:00.000Z')).toHaveLength(0);
     expect(db.countAlerts()).toBe(0);
 
+    db.close();
+  });
+
+  test('only excludes the literal dup_ prefix when selecting an active decision', () => {
+    const db = createTestDatabase();
+    const insert = (id: string, stopAt: string) => db.insertDecision({
+      $id: id,
+      $uuid: id,
+      $alert_id: 1,
+      $created_at: '2026-01-01T00:00:00.000Z',
+      $stop_at: stopAt,
+      $value: '198.51.100.42',
+      $type: 'ban',
+      $origin: 'crowdsec',
+      $scenario: 'crowdsecurity/test',
+      $raw_data: JSON.stringify({ id, value: '198.51.100.42', stop_at: stopAt }),
+    });
+    insert('real', '2027-01-02T00:00:00.000Z');
+    insert('dup_1', '2027-01-04T00:00:00.000Z');
+    insert('dupX1', '2027-01-03T00:00:00.000Z');
+
+    expect(db.getActiveDecisionByValue('198.51.100.42', '2026-01-01T00:00:00.000Z')?.id).toBe('dupX1');
     db.close();
   });
 
@@ -975,6 +998,38 @@ describe('CrowdsecDatabase', () => {
     db.close();
   });
 
+  test('migrates legacy search indexes to trigram substring indexes', () => {
+    const dbPath = createTestDatabasePath();
+    let db = new CrowdsecDatabase({ dbPath });
+    db.insertAlert({
+      $id: 1,
+      $uuid: 'legacy-search-alert',
+      $created_at: '2026-01-01T00:00:00.000Z',
+      $scenario: 'crowdsecurity/netgear_rce',
+      $source_ip: '198.51.100.42',
+      $message: 'legacy search alert',
+      $raw_data: JSON.stringify({ id: 1, scenario: 'crowdsecurity/netgear_rce' }),
+    });
+    db.close();
+
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      DROP TABLE alerts_fts;
+      DROP TABLE decisions_fts;
+      DROP TABLE decision_fts_rows;
+      CREATE VIRTUAL TABLE alerts_fts USING fts5(alert_id UNINDEXED, search_text, tokenize = 'unicode61');
+      CREATE VIRTUAL TABLE decisions_fts USING fts5(decision_id UNINDEXED, search_text, tokenize = 'unicode61');
+      CREATE TABLE decision_fts_rows(decision_id TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL UNIQUE);
+    `);
+    legacy.close();
+
+    db = new CrowdsecDatabase({ dbPath });
+    const definition = db.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'alerts_fts'").get() as { sql: string };
+    expect(definition.sql).toMatch(/tokenize\s*=\s*'trigram'/i);
+    expect((db.db.prepare('SELECT COUNT(*) AS count FROM alerts_fts WHERE alerts_fts MATCH ?').get('gear_r') as { count: number }).count).toBe(1);
+    db.close();
+  });
+
   test('fresh databases default dashboard auth on', () => {
     const db = createTestDatabase();
 
@@ -1587,6 +1642,21 @@ describe('CrowdsecDatabase', () => {
     reopened.close();
   });
 
+  test('can disable WAL and persists the rollback journal mode', () => {
+    const dbPath = createTestDatabasePath();
+    const walDatabase = new CrowdsecDatabase({ dbPath });
+    expect(walDatabase.db.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
+    walDatabase.close();
+
+    const rollbackDatabase = new CrowdsecDatabase({ dbPath, walEnabled: false });
+    expect(rollbackDatabase.db.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
+    rollbackDatabase.close();
+
+    const reopened = new Database(dbPath);
+    expect(reopened.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
+    reopened.close();
+  });
+
   test('docker entrypoint preserves SQLite WAL files for restart recovery', () => {
     const entrypoint = readFileSync(path.resolve(process.cwd(), 'docker-entrypoint.sh'), 'utf8');
 
@@ -1597,12 +1667,15 @@ describe('CrowdsecDatabase', () => {
   test('load-test Docker image keeps synthetic data away from the regular database', () => {
     const dockerfile = readFileSync(path.resolve(process.cwd(), 'Dockerfile'), 'utf8');
     const entrypoint = readFileSync(path.resolve(process.cwd(), 'docker-loadtest-entrypoint.sh'), 'utf8');
+    const loadTestServer = readFileSync(path.resolve(process.cwd(), 'scripts/load-test-server.ts'), 'utf8');
 
     expect(dockerfile).toContain('FROM runner AS loadtest');
     expect(dockerfile).toContain('ENV LOADTEST_DB_DIR="/tmp/crowdsec-web-ui-load-test"');
-    expect(entrypoint).toContain('export DB_DIR="$LOADTEST_DB_DIR"');
+    expect(entrypoint).toContain('export LOADTEST_DB_DIR');
+    expect(entrypoint).not.toContain('export DB_DIR=');
     expect(entrypoint).not.toContain('${DB_DIR:-');
     expect(entrypoint).not.toContain('chown -R node:node /app/data');
+    expect(loadTestServer).toContain('CONFIG_STORAGE_DATA_DIR: dbDir');
   });
 
   test('load-test Docker entrypoint applies a selected profile and keeps environment overrides', () => {
@@ -1640,11 +1713,13 @@ describe('CrowdsecDatabase', () => {
 
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('LOADTEST_PROFILE=blocklist\n');
-    expect(result.stdout).toContain('LOADTEST_ALERTS=42\n');
-    expect(result.stdout).toContain('LOADTEST_DECISIONS=410463\n');
-    expect(result.stdout).toContain('LOADTEST_SEED=1337\n');
-    expect(result.stdout).toContain(`DB_DIR=${dbDir}\n`);
+    const environment = new Set(result.stdout.trim().split('\n'));
+    expect(environment).toContain('LOADTEST_PROFILE=blocklist');
+    expect(environment).toContain('LOADTEST_ALERTS=42');
+    expect(environment).toContain('LOADTEST_DECISIONS=410463');
+    expect(environment).toContain('LOADTEST_SEED=1337');
+    expect(environment).toContain(`LOADTEST_DB_DIR=${dbDir}`);
+    expect([...environment].some((entry) => entry.startsWith('DB_DIR='))).toBe(false);
   });
 
   test('migrates legacy notification rules, notifications, and seeds incidents from history', () => {
